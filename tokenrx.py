@@ -113,11 +113,13 @@ def apply_rx(args):
 
 def undo_rx(args):
     try:
-        name = rx.undo(env_of(args), args.name)
+        name, notes = rx.undo(env_of(args), args.name)
     except rx.RxError as e:
         print(e)
         return 1
     print(L(f"되돌렸어요: {name}", f"Reverted: {name}"))
+    for note in notes:
+        print(f"  - {note}")
     return 0
 
 

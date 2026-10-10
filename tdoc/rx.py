@@ -3,11 +3,13 @@
 
 처방은 바꿀 파일 목록(Change)을 만들기만 하고, 실제 쓰기는 apply()가 한다.
 """
+import copy
 import datetime as dt
 import difflib
 import json
 import os
 import re
+import hashlib
 import shutil
 import sys
 import time
@@ -48,18 +50,37 @@ def _read(path):
         return f.read()
 
 
-def _json_change(path, mutate):
-    """JSON 설정 파일을 읽어 mutate(dict)로 바꾼 결과를 Change로 만든다."""
+def _json_change(path, mutate, allow_same=False):
+    """JSON 설정 파일을 읽어 mutate(dict)로 바꾼 결과를 Change로 만든다. 바뀐 게 없으면 None(allow_same) 또는 오류."""
     old = _read(path)
     try:
-        data = json.loads(old) if old and old.strip() else {}
+        before = json.loads(old) if old and old.strip() else {}
     except ValueError:
         raise RxError(L(f"{path} 파일 형식이 올바르지 않아서 건드리지 않았어요.", f"{path} isn't valid JSON, so it was left untouched."))
+    data = copy.deepcopy(before)
     mutate(data)
-    new = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    if new == old:
+    if data == before:   # 글자 모양(들여쓰기)이 아니라 내용으로 비교한다
+        if allow_same:
+            return None
         raise RxError(_already())
-    return (path, old, new)
+    return (path, old, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def _bundled(name):
+    with open(os.path.join(HERE, "hooks", name), encoding="utf-8") as f:
+        return f.read()
+
+
+def _hook_plan(env, script, mutate):
+    """훅 스크립트 복사 + 설정 등록. 이미 깔려 있으면 바뀐 부분(새 스크립트, 빠진 등록)만 고친다."""
+    dest = os.path.join(env.tool_dir, script)
+    changes = [] if _read(dest) == _bundled(script) else [_copy_change(script, dest)]
+    js = _json_change(env.settings, mutate, allow_same=True)
+    if js:
+        changes.append(js)
+    if not changes:
+        raise RxError(_already())
+    return changes
 
 
 def _copy_change(src_name, dest):
@@ -84,14 +105,13 @@ def plan_idle_guard(env):
     dest = os.path.join(env.tool_dir, "idle_guard.py")
 
     def mutate(d):
-        hooks = d.setdefault("hooks", {})
-        if any("idle_guard.py" in h.get("command", "")
-               for g in hooks.get("UserPromptSubmit", []) for h in g.get("hooks", [])):
-            raise RxError(_already())
         # 같은 스크립트가 새 대화 시작(SessionStart)도 받아서, 방금 남긴 인수인계 메모를 새 대화에 알린다
         for event in ("UserPromptSubmit", "SessionStart"):
-            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": _command(env, dest)}]})
-    return [_copy_change("idle_guard.py", dest), _json_change(env.settings, mutate)]
+            groups = d.get("hooks", {}).get(event, [])
+            if not any("idle_guard.py" in h.get("command", "") for g in groups for h in g.get("hooks", [])):
+                d.setdefault("hooks", {}).setdefault(event, []).append(
+                    {"hooks": [{"type": "command", "command": _command(env, dest)}]})
+    return _hook_plan(env, "idle_guard.py", mutate)
 
 
 def plan_limit_recorder(env):
@@ -100,11 +120,11 @@ def plan_limit_recorder(env):
     def mutate(d):
         cur = d.get("statusLine")
         if cur and "limit_recorder.py" in json.dumps(cur):
-            raise RxError(_already())
+            return
         if cur:
             raise RxError(L("이미 다른 상태 표시줄을 쓰고 있어서 덮어쓰지 않았어요.", "You already have another status line, so it wasn't overwritten."))
         d["statusLine"] = {"type": "command", "command": _command(env, dest), "padding": 0}
-    return [_copy_change("limit_recorder.py", dest), _json_change(env.settings, mutate)]
+    return _hook_plan(env, "limit_recorder.py", mutate)
 
 
 def plan_subagent_sonnet(env):
@@ -279,18 +299,21 @@ def apply(rx_id, changes, env):
     os.makedirs(bdir, exist_ok=True)
     manifest = {"rx": rx_id, "created": stamp, "files": []}
     for i, (path, old, new) in enumerate(changes):
-        entry = {"path": path, "existed": old is not None}
+        # 쓴 내용과 계획한 원본도 남겨서, 되돌릴 때 그 뒤에 바뀐 내용을 지킬 수 있게 한다
+        entry = {"path": path, "existed": old is not None, "written": _sha(new), "new": f"{i}.new"}
+        _write(os.path.join(bdir, entry["new"]), new)
         if old is not None:
             entry["backup"] = f"{i}.bak"
+            entry["old"] = f"{i}.old"
             shutil.copy2(path, os.path.join(bdir, entry["backup"]))
+            _write(os.path.join(bdir, entry["old"]), old)
         manifest["files"].append(entry)
     with open(os.path.join(bdir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     for path, old, new in changes:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tdoc-tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
-            f.write(new)
+        _write(tmp, new)
         os.replace(tmp, path)
     return os.path.basename(bdir)
 
@@ -327,12 +350,145 @@ def undo(env, name=None):
         raise RxError(L(f"나중에 적용한 처방({', '.join(later)})이 같은 파일을 바꿨어요. 그것부터 되돌려 주세요.",
                          f"A later prescription ({', '.join(later)}) changed the same file. Undo that one first."))
     bdir = os.path.join(env.backups, name)
+    notes = []
     for entry in m["files"]:
-        if entry["existed"]:
-            shutil.copy2(os.path.join(bdir, entry["backup"]), entry["path"])
-        elif os.path.exists(entry["path"]):
-            os.remove(entry["path"])
+        path = entry["path"]
+        try:
+            cur = _read_raw(path)
+        except ValueError:
+            cur = ""   # UTF-8이 아닌 내용으로 바뀌었으면 바뀐 것으로 본다
+        if "written" not in entry or (cur is not None and _sha(cur) == entry["written"]):
+            # 적용한 뒤 아무도 안 건드렸으면 원래 파일 그대로 되돌린다(예전 백업도 이 방식)
+            if entry["existed"]:
+                shutil.copy2(os.path.join(bdir, entry["backup"]), path)
+            elif os.path.exists(path):
+                os.remove(path)
+            continue
+        if cur is None:
+            notes.append(L(f"{path}: 처방을 적용한 뒤 지워져 있어서 그대로 뒀어요.",
+                           f"{path}: deleted after the prescription was applied, so it was left alone."))
+            continue
+        # 적용한 뒤 바뀐 파일: 처방이 넣은 부분만 빼고 나머지(사용자나 Claude Code가 바꾼 내용)는 지킨다
+        old = _read_raw(os.path.join(bdir, entry["old"])) if entry.get("old") else None
+        new = _read_raw(os.path.join(bdir, entry["new"]))
+        merged, conflicts = (_revert_json if path.endswith(".json") else _revert_text)(old, new, cur)
+        if merged is None:
+            notes.append(L(f"{path}: 적용한 뒤 내용이 많이 바뀌어서 자동으로 되돌리지 못했어요. 원본은 {bdir}에 있어요.",
+                           f"{path}: changed too much since it was applied to revert automatically. The original is in {bdir}."))
+            continue
+        if not entry["existed"] and merged.strip() in ("", "{}"):
+            os.remove(path)
+        else:
+            tmp = path + ".tdoc-tmp"
+            _write(tmp, merged)
+            os.replace(tmp, path)
+        notes.append(L(f"{path}: 적용한 뒤 바뀐 내용은 남기고, 처방이 넣은 부분만 뺐어요.",
+                       f"{path}: kept the changes made after it was applied and removed only what the prescription added."))
+        if conflicts:
+            notes.append(L(f"{path}: 처방이 넣은 값 {conflicts}개는 그 뒤에 직접 바뀌어 있어서 그대로 뒀어요.",
+                           f"{path}: {conflicts} value(s) the prescription set were changed afterwards, so they were left as is."))
     m["undone"] = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     with open(os.path.join(bdir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(m, f, ensure_ascii=False, indent=2)
-    return name
+    return name, notes
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _write(path, text):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def _read_raw(path):
+    """줄바꿈을 바꾸지 않고 읽는다(적용할 때 쓴 내용과 정확히 비교하려고)."""
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+_MISSING = object()
+
+
+def _json_ops(old, new, path=()):
+    """old에서 new로 바뀐 곳: ("set", 경로, 옛 값, 새 값) 또는 목록 끝에 덧붙인 ("append", 경로, 항목들)."""
+    if isinstance(new, dict) and (old is _MISSING or isinstance(old, dict)):
+        base = {} if old is _MISSING else old
+        out = []
+        for k in list(base) + [k for k in new if k not in base]:
+            out += _json_ops(base.get(k, _MISSING), new.get(k, _MISSING), path + (k,))
+        return out
+    if isinstance(new, list) and (old is _MISSING or isinstance(old, list)):
+        base = [] if old is _MISSING else old
+        if new[:len(base)] == base:
+            return [("append", path, new[len(base):])] if len(new) > len(base) else []
+    if old is new or (old is not _MISSING and new is not _MISSING and old == new):
+        return []
+    return [("set", path, old, new)]
+
+
+def _jget(d, path):
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return _MISSING
+        d = d[k]
+    return d
+
+
+def _jset(d, path, value):
+    for k in path[:-1]:
+        d = d.setdefault(k, {})
+    if value is _MISSING:
+        d.pop(path[-1], None)
+    else:
+        d[path[-1]] = value
+
+
+def _revert_json(old, new, cur):
+    """지금 설정(cur)에서 처방이 넣은 값만 원래대로 돌린다. (결과 문자열, 그 뒤 직접 바뀌어서 둔 값 수)."""
+    try:
+        before = json.loads(old) if old and old.strip() else {}
+        after = json.loads(new)
+        now = json.loads(cur) if cur.strip() else {}
+    except ValueError:
+        return None, 0
+    if not isinstance(now, dict):
+        return None, 0
+    conflicts = 0
+    for op in _json_ops(before, after):
+        path = op[1]
+        if op[0] == "set":
+            if _jget(now, path) == op[3]:
+                _jset(now, path, op[2])
+            elif _jget(now, path) is not _MISSING:
+                conflicts += 1
+        else:
+            items = _jget(now, path)
+            if isinstance(items, list):
+                for item in op[2]:
+                    if item in items:
+                        items.remove(item)
+        # 처방이 새로 만든 빈 묶음(예: hooks.SessionStart)은 지운다
+        for depth in range(len(path), 0, -1):
+            v = _jget(now, path[:depth])
+            if v in ({}, []) and _jget(before, path[:depth]) is _MISSING:
+                _jset(now, path[:depth], _MISSING)
+    return json.dumps(now, indent=2, ensure_ascii=False) + "\n", conflicts
+
+
+def _revert_text(old, new, cur):
+    """처방이 넣거나 바꾼 줄 묶음을 지금 파일에서 찾아 원래대로 돌린다. 못 찾으면 (None, 0)."""
+    a = (old or "").splitlines(keepends=True)
+    b = new.splitlines(keepends=True)
+    result = cur
+    for tag, i1, i2, j1, j2 in reversed(difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()):
+        if tag == "equal":
+            continue
+        added, removed = "".join(b[j1:j2]), "".join(a[i1:i2])
+        if not added or result.count(added) != 1:
+            return None, 0   # 처방이 지운 줄이나, 그 뒤 바뀐 줄은 자리를 확실히 알 수 없다
+        result = result.replace(added, removed)
+    return result, 0

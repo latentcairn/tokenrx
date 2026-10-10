@@ -15,6 +15,7 @@ import time
 
 THRESHOLD_TOKENS = 100_000   # 이보다 짧은 대화는 다시 저장해도 부담이 작다
 CONFIRM_WINDOW = 600         # 경고 뒤 이 시간(초) 안에 다시 보내면 그대로 진행
+CONFIRMED_FOR = 1800         # 이어가기로 한 뒤 이 시간(초) 동안은 다시 막지 않는다
 TAIL_BYTES = 4_000_000       # 기록 파일 끝에서 이만큼만 읽는다
 STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "idle_guard_state.json")
 HANDOFF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handoff")
@@ -207,9 +208,14 @@ def load_state():
     return load_json(STATE)
 
 
+def _stamp(v):
+    """상태 값의 마지막 시각. 예전 버전은 경고 시각 숫자 하나만 남겼다."""
+    return v if isinstance(v, (int, float)) else max((x for x in v.values() if isinstance(x, (int, float))), default=0)
+
+
 def save_state(state):
     now = time.time()
-    state = {k: v for k, v in state.items() if now - v < 86400}
+    state = {k: v for k, v in state.items() if now - _stamp(v) < 86400}
     with open(STATE, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
@@ -230,12 +236,16 @@ def main():
     gap = time.time() - ts
     if gap <= ttl or context < THRESHOLD_TOKENS:
         return
-    state = load_state()
-    if session in state and time.time() - state[session] < CONFIRM_WINDOW:
-        del state[session]
+    state, now = load_state(), time.time()
+    entry = state.get(session)
+    entry = {"warned": entry} if isinstance(entry, (int, float)) else entry if isinstance(entry, dict) else {}
+    if now - entry.get("confirmed", 0) < CONFIRMED_FOR:
+        return   # 이미 이어가기로 했다면, 요청이 API 오류로 실패해 다시 보내도 또 막지 않는다
+    if now - entry.get("warned", 0) < CONFIRM_WINDOW:
+        state[session] = {"confirmed": now}
         save_state(state)
         return
-    state[session] = time.time()
+    state[session] = {"warned": now}
     save_state(state)
 
     price = cache_price(model)

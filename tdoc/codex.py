@@ -120,110 +120,113 @@ def parse_file(path):
 
     with open(path, "rb") as fh:
         for raw in fh:
-            head = raw[:220]
-            if b'"type":"token_usage_record"' in head:
-                r = json.loads(raw)
-                p = r.get("payload") or {}
-                tur.append([p.get("response_id"), _ts(r.get("timestamp")), p.get("thread_id") or name,
-                            model, effort] + _usage(p.get("usage")) + [p.get("turn_id"), pend_tur])
-                pend_tur = False
-            elif b'"token_count"' in head:
-                r = json.loads(raw)
-                p = r.get("payload") or {}
-                ts = _ts(r.get("timestamp"))
-                info = p.get("info")
-                if info:
-                    total = (info.get("total_token_usage") or {}).get("total_tokens")
-                    if total != last_total:
-                        last_total = total
-                        tc.append([f"{r.get('timestamp')}|{total}", ts, name, model, effort]
-                                  + _usage(info.get("last_token_usage")) + [None, pend_tc])
-                        pend_tc = False
-                rl = p.get("rate_limits") or {}
-                for window in ("primary", "secondary"):
-                    w = rl.get(window)
-                    if isinstance(w, dict) and w.get("used_percent") is not None:
-                        limits.append([ts, rl.get("limit_id") or "codex", window, float(w["used_percent"]),
-                                       w.get("window_minutes"), w.get("resets_at"), rl.get("plan_type"),
-                                       name, model, effort])
-            elif b'"type":"event_msg"' in head:
-                # 이벤트 종류는 "payload":{"type":"... 바로 뒤에 있다. 한 번만 찾고 그 자리에서 비교한다.
-                j = head.find(b'"payload":{"type":"') + 19
-                if raw.startswith(b'item_completed"', j):
-                    # 항목 종류는 줄 앞 220~250바이트쯤에 있다
-                    i = raw.find(b'"item":{"type":"', j, 400) + 16
-                    if i < 16:
-                        continue
-                    if raw.startswith(b'CommandExecution"', i):
-                        t = turn_of(raw, i)
-                        t["cmd"] += 1
-                        # 성공한 명령은 해석하지 않는다(대부분이고 출력이 커서 느리다).
-                        # 실제 기록에서 status가 completed면 종료 코드는 항상 0이었다.
-                        if b'"status":"completed"' in raw:
-                            run, last_fail = 0, None
-                            continue
-                        it = (json.loads(raw).get("payload") or {}).get("item") or {}
-                        st, code = it.get("status"), it.get("exit_code")
-                        if st == "completed" and code in (0, None):
-                            run, last_fail = 0, None
-                            continue
-                        out = it.get("aggregated_output") or ((it.get("stderr") or "") + (it.get("stdout") or ""))
-                        cat = "permission" if st == "declined" else cmd_category(out)
-                        t["fail"] += 1
-                        t["cats"][cat] = t["cats"].get(cat, 0) + 1
-                        run += 1
-                        if run == 3:
-                            t["streak"] += 1
-                        sig = hashlib.sha1(json.dumps(it.get("command"), ensure_ascii=False).encode("utf-8")).hexdigest()
-                        if sig == last_fail:
-                            t["rerun"] += 1
-                        last_fail = sig
-                        pend_tur = pend_tc = True
-                    elif raw.startswith(b'McpToolCall"', i):
-                        t = turn_of(raw, i)
-                        it = (json.loads(raw).get("payload") or {}).get("item") or {}
-                        res = it.get("result")
-                        bad = it.get("status") != "completed" or (isinstance(res, dict) and bool(res.get("isError")))
-                        m = t["mcp"].setdefault(it.get("server") or "?", [0, 0])
-                        m[0] += 1
-                        m[1] += int(bad)
-                        if bad:
-                            pend_tur = pend_tc = True
-                    elif raw.startswith(b'FileChange"', i) and b'"status":"completed"' not in raw:
-                        turn_of(raw, i)["fc_fail"] += 1
-                        pend_tur = pend_tc = True
-                elif (raw.startswith(b'task_started"', j) or raw.startswith(b'task_complete"', j)
-                      or raw.startswith(b'turn_aborted"', j)):
+            try:
+                head = raw[:220]
+                if b'"type":"token_usage_record"' in head:
                     r = json.loads(raw)
                     p = r.get("payload") or {}
-                    tid = p.get("turn_id")
-                    if not tid:
-                        continue
-                    t = turns.get(tid)
-                    if t is None:
-                        t = turns[tid] = _new_turn(_ts(r.get("timestamp")))
-                    kind = p.get("type")
-                    if kind == "task_started":
-                        last_started = tid
-                        if t["st"] is None:
-                            t["st"] = "open"
-                    elif kind == "task_complete":
-                        e = p.get("error")
-                        code = (e.get("codex_error_info") if isinstance(e, dict) else None) or ("error" if e else "")
-                        if isinstance(code, dict):
-                            code = next(iter(code), "error")
-                        t["st"], t["code"] = ("error", str(code)) if e else ("ok", "")
-                    elif kind == "turn_aborted" and t["st"] not in ("ok", "error"):
-                        t["st"], t["code"] = "aborted", p.get("reason") or ""
-            elif b'"type":"turn_context"' in head:
-                p = json.loads(raw).get("payload") or {}
-                model, effort = p.get("model") or model, p.get("effort") or effort
-            elif b'"type":"session_meta"' in head:
-                p = json.loads(raw).get("payload") or {}
-                meta.update(thread=p.get("id") or name, parent=p.get("parent_thread_id"),
-                            source=p.get("thread_source") or "", cwd=p.get("cwd") or "")
-            elif b'"type":"compacted"' in head:
-                meta["compactions"] += 1
+                    tur.append([p.get("response_id"), _ts(r.get("timestamp")), p.get("thread_id") or name,
+                                model, effort] + _usage(p.get("usage")) + [p.get("turn_id"), pend_tur])
+                    pend_tur = False
+                elif b'"token_count"' in head:
+                    r = json.loads(raw)
+                    p = r.get("payload") or {}
+                    ts = _ts(r.get("timestamp"))
+                    info = p.get("info")
+                    if info:
+                        total = (info.get("total_token_usage") or {}).get("total_tokens")
+                        if total != last_total:
+                            last_total = total
+                            tc.append([f"{r.get('timestamp')}|{total}", ts, name, model, effort]
+                                      + _usage(info.get("last_token_usage")) + [None, pend_tc])
+                            pend_tc = False
+                    rl = p.get("rate_limits") or {}
+                    for window in ("primary", "secondary"):
+                        w = rl.get(window)
+                        if isinstance(w, dict) and w.get("used_percent") is not None:
+                            limits.append([ts, rl.get("limit_id") or "codex", window, float(w["used_percent"]),
+                                           w.get("window_minutes"), w.get("resets_at"), rl.get("plan_type"),
+                                           name, model, effort])
+                elif b'"type":"event_msg"' in head:
+                    # 이벤트 종류는 "payload":{"type":"... 바로 뒤에 있다. 한 번만 찾고 그 자리에서 비교한다.
+                    j = head.find(b'"payload":{"type":"') + 19
+                    if raw.startswith(b'item_completed"', j):
+                        # 항목 종류는 줄 앞 220~250바이트쯤에 있다
+                        i = raw.find(b'"item":{"type":"', j, 400) + 16
+                        if i < 16:
+                            continue
+                        if raw.startswith(b'CommandExecution"', i):
+                            t = turn_of(raw, i)
+                            t["cmd"] += 1
+                            # 성공한 명령은 해석하지 않는다(대부분이고 출력이 커서 느리다).
+                            # 실제 기록에서 status가 completed면 종료 코드는 항상 0이었다.
+                            if b'"status":"completed"' in raw:
+                                run, last_fail = 0, None
+                                continue
+                            it = (json.loads(raw).get("payload") or {}).get("item") or {}
+                            st, code = it.get("status"), it.get("exit_code")
+                            if st == "completed" and code in (0, None):
+                                run, last_fail = 0, None
+                                continue
+                            out = it.get("aggregated_output") or ((it.get("stderr") or "") + (it.get("stdout") or ""))
+                            cat = "permission" if st == "declined" else cmd_category(out)
+                            t["fail"] += 1
+                            t["cats"][cat] = t["cats"].get(cat, 0) + 1
+                            run += 1
+                            if run == 3:
+                                t["streak"] += 1
+                            sig = hashlib.sha1(json.dumps(it.get("command"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                            if sig == last_fail:
+                                t["rerun"] += 1
+                            last_fail = sig
+                            pend_tur = pend_tc = True
+                        elif raw.startswith(b'McpToolCall"', i):
+                            t = turn_of(raw, i)
+                            it = (json.loads(raw).get("payload") or {}).get("item") or {}
+                            res = it.get("result")
+                            bad = it.get("status") != "completed" or (isinstance(res, dict) and bool(res.get("isError")))
+                            m = t["mcp"].setdefault(it.get("server") or "?", [0, 0])
+                            m[0] += 1
+                            m[1] += int(bad)
+                            if bad:
+                                pend_tur = pend_tc = True
+                        elif raw.startswith(b'FileChange"', i) and b'"status":"completed"' not in raw:
+                            turn_of(raw, i)["fc_fail"] += 1
+                            pend_tur = pend_tc = True
+                    elif (raw.startswith(b'task_started"', j) or raw.startswith(b'task_complete"', j)
+                          or raw.startswith(b'turn_aborted"', j)):
+                        r = json.loads(raw)
+                        p = r.get("payload") or {}
+                        tid = p.get("turn_id")
+                        if not tid:
+                            continue
+                        t = turns.get(tid)
+                        if t is None:
+                            t = turns[tid] = _new_turn(_ts(r.get("timestamp")))
+                        kind = p.get("type")
+                        if kind == "task_started":
+                            last_started = tid
+                            if t["st"] is None:
+                                t["st"] = "open"
+                        elif kind == "task_complete":
+                            e = p.get("error")
+                            code = (e.get("codex_error_info") if isinstance(e, dict) else None) or ("error" if e else "")
+                            if isinstance(code, dict):
+                                code = next(iter(code), "error")
+                            t["st"], t["code"] = ("error", str(code)) if e else ("ok", "")
+                        elif kind == "turn_aborted" and t["st"] not in ("ok", "error"):
+                            t["st"], t["code"] = "aborted", p.get("reason") or ""
+                elif b'"type":"turn_context"' in head:
+                    p = json.loads(raw).get("payload") or {}
+                    model, effort = p.get("model") or model, p.get("effort") or effort
+                elif b'"type":"session_meta"' in head:
+                    p = json.loads(raw).get("payload") or {}
+                    meta.update(thread=p.get("id") or name, parent=p.get("parent_thread_id"),
+                                source=p.get("thread_source") or "", cwd=p.get("cwd") or "")
+                elif b'"type":"compacted"' in head:
+                    meta["compactions"] += 1
+            except ValueError:
+                continue   # Codex가 쓰는 중이라 잘린 줄이나 깨진 줄은 건너뛴다
     # 파일의 마지막 턴이 안 끝났으면 앱을 닫았거나 멈춘 경우다
     if last_started and turns[last_started]["st"] == "open":
         turns[last_started]["last"] = True

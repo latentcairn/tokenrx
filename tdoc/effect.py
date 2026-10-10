@@ -100,5 +100,8 @@ def describe(e):
                  f"{MIN_AFTER_DAYS}일쯤 쓰고 다시 보세요.",
                  f"Not enough logs since it was applied yet ({e['days_after']:.1f} days, {e['n_after']} requests). "
                  f"Check again after about {MIN_AFTER_DAYS} days.")
+    if e["after"] is None:
+        return L("적용 뒤 기록의 비용을 계산할 수 없어서 비교하지 못했어요(가격을 모르는 모델일 수 있어요).",
+                 "Couldn't price the logs since it was applied, so there's nothing to compare (possibly an unknown model).")
     return L(f"{tr(e['label'])}: 적용 전 {e['before']:.1f}% → 적용 뒤 {e['after']:.1f}%",
              f"{tr(e['label'])}: {e['before']:.1f}% before → {e['after']:.1f}% after")
