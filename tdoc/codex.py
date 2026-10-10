@@ -12,9 +12,12 @@ import json
 import os
 
 from .forecast import attribute_limits, current, describe, forecast
+from .i18n import L
 
 CACHE_VERSION = 1
 MISS_MIN_TOKENS = 20_000
+DEFAULT_EFFORT = "(default)"   # 생각 수준이 기록되지 않은 요청
+UNKNOWN_MODEL = "(unknown)"
 
 
 def _ts(s):
@@ -168,17 +171,17 @@ def analyze(reqs, limits, threads, titles, days=0):
     a["weekly_total"] = sum(d["delta"] for d in weekly)
     by_effort = collections.defaultdict(collections.Counter)
     for r in reqs:
-        e = by_effort[r["effort"] or "기본"]
+        e = by_effort[r["effort"] or DEFAULT_EFFORT]
         e["reqs"] += 1
         e["tokens"] += r["inp"] + r["out"]
         e["reasoning"] += r["reasoning"]
     for d in weekly:
-        by_effort[d["effort"] or "기본"]["limit"] += d["delta"]
+        by_effort[d["effort"] or DEFAULT_EFFORT]["limit"] += d["delta"]
     a["by_effort"] = by_effort
     a["limit_by_model"] = collections.Counter()
     a["limit_by_thread"] = collections.Counter()
     for d in weekly:
-        a["limit_by_model"][d["model"] or "알 수 없음"] += d["delta"]
+        a["limit_by_model"][d["model"] or UNKNOWN_MODEL] += d["delta"]
         meta = threads.get(d["thread"]) or {}
         a["limit_by_thread"][meta.get("parent") or d["thread"]] += d["delta"]
 
@@ -207,14 +210,20 @@ def title_of(a, thread):
     return a["titles"].get(thread) or os.path.basename(meta.get("cwd") or "") or thread[:8]
 
 
+def effort_label(effort):
+    return effort if effort != DEFAULT_EFFORT else L("기본", "default")
+
+
 def diagnoses(a):
     out = []
     for f in current(a.get("forecast", [])):
         out.append({
-            "title": "한도 예보",
-            "value": f"{f['used']:.0f}% 사용" if f["status"] != "reset" else "초기화됨",
+            "title": L("한도 예보", "Limit forecast"),
+            "value": L(f"{f['used']:.0f}% 사용", f"{f['used']:.0f}% used") if f["status"] != "reset" else L("초기화됨", "Reset"),
             "detail": describe(f),
-            "rx": "한도가 빠듯하면 생각 수준을 낮추거나 서브에이전트 수를 줄이세요." if f["status"] == "danger" else "",
+            "rx": L("한도가 빠듯하면 생각 수준을 낮추거나 서브에이전트 수를 줄이세요.",
+                    "If you're tight on limit, lower the reasoning effort or run fewer subagents.")
+                  if f["status"] == "danger" else "",
             "level": 2 if f["status"] == "danger" else 0,
         })
     if a["n"] == 0:
@@ -224,46 +233,61 @@ def diagnoses(a):
     eff = a["by_effort"]
     rows = sorted(eff.items(), key=lambda kv: -kv[1]["limit"])
     per100 = {k: 100 * v["limit"] / v["reqs"] for k, v in eff.items() if v["reqs"] >= 30}
-    detail = ", ".join(f"{k} {v['limit']:.0f}%p" for k, v in rows if v["limit"] > 0) or "기록 부족"
+    detail = ", ".join(f"{effort_label(k)} {v['limit']:.0f}{L('%p', ' pts')}" for k, v in rows if v["limit"] > 0) \
+        or L("기록 부족", "not enough data")
     if "ultra" in per100 and "high" in per100 and per100["high"] > 0:
-        detail += (f". 요청 1번당으로 보면 ultra가 high보다 한도를 {per100['ultra'] / per100['high']:.1f}배 먹어요"
-                   f"(100번당 ultra {per100['ultra']:.1f}%p, high {per100['high']:.1f}%p)")
+        ratio = per100["ultra"] / per100["high"]
+        detail += L(f". 요청 1번당으로 보면 ultra가 high보다 한도를 {ratio:.1f}배 먹어요"
+                    f"(100번당 ultra {per100['ultra']:.1f}%p, high {per100['high']:.1f}%p)",
+                    f". Per request, ultra burns {ratio:.1f}x the limit of high "
+                    f"(per 100 requests: ultra {per100['ultra']:.1f} pts, high {per100['high']:.1f} pts)")
     ultra_share = eff.get("ultra", {}).get("limit", 0) / wt
     out.append({
-        "title": "생각 수준별 주간 한도 소모",
-        "value": f"ultra가 {100 * ultra_share:.0f}%" if "ultra" in eff else "-",
-        "detail": f"분석 기간에 주간 한도를 합계 {a['weekly_total']:.0f}%p 썼어요. 생각 수준별로는 {detail}.",
-        "rx": "평소 작업은 high로 충분한 경우가 많아요. 기본값을 high로 바꾸고, 어려운 일에만 ultra를 고르세요.",
+        "title": L("생각 수준별 주간 한도 소모", "Weekly limit burn by reasoning effort"),
+        "value": L(f"ultra가 {100 * ultra_share:.0f}%", f"ultra: {100 * ultra_share:.0f}%") if "ultra" in eff else "-",
+        "detail": L(f"분석 기간에 주간 한도를 합계 {a['weekly_total']:.0f}%p 썼어요. 생각 수준별로는 {detail}.",
+                    f"You used {a['weekly_total']:.0f} pts of weekly limit in this period. By effort: {detail}."),
+        "rx": L("평소 작업은 high로 충분한 경우가 많아요. 기본값을 high로 바꾸고, 어려운 일에만 ultra를 고르세요.",
+                "high is usually enough for everyday work. Make it the default and pick ultra only for hard problems."),
         "rx_id": "codex-effort-high",
         "level": 2 if ultra_share > 0.7 else 1 if ultra_share > 0.4 else 0,
     })
 
     out.append({
-        "title": "서브에이전트가 쓴 주간 한도",
-        "value": f"{a['sub_limit']:.0f}%p ({100 * a['sub_limit'] / wt:.0f}%)",
-        "detail": "Codex가 일을 나눠 맡긴 하위 작업들이 쓴 한도예요.",
-        "rx": "단순 조사·탐색을 맡는 하위 작업은 개수를 줄이거나 더 가벼운 모델로 돌려 보세요.",
+        "title": L("서브에이전트가 쓴 주간 한도", "Weekly limit used by subagents"),
+        "value": L(f"{a['sub_limit']:.0f}%p ({100 * a['sub_limit'] / wt:.0f}%)",
+                   f"{a['sub_limit']:.0f} pts ({100 * a['sub_limit'] / wt:.0f}%)"),
+        "detail": L("Codex가 일을 나눠 맡긴 하위 작업들이 쓴 한도예요.",
+                    "Limit used by the sub-tasks Codex delegated."),
+        "rx": L("단순 조사·탐색을 맡는 하위 작업은 개수를 줄이거나 더 가벼운 모델로 돌려 보세요.",
+                "Run fewer exploration sub-tasks, or give them a lighter model."),
         "level": 1 if a["sub_limit"] / wt > 0.4 else 0,
     })
 
     tot = a["tot"]
     hit = tot["cached"] / tot["inp"] if tot["inp"] else 0
     missed = sum(m["uncached"] for m in a["misses"])
+    share = 100 * missed / max(tot["inp"], 1)
     out.append({
-        "title": "캐시 적중률",
+        "title": L("캐시 적중률", "Cache hit rate"),
         "value": f"{100 * hit:.1f}%",
-        "detail": f"입력 {tot['inp']:,} 토큰 중 캐시로 싸게 읽은 비율이에요. 캐시가 깨진 순간이 {len(a['misses'])}번 있었고, "
-                  f"그때 캐시 없이 다시 읽은 양은 {missed:,} 토큰(전체 입력의 {100 * missed / max(tot['inp'], 1):.1f}%)이에요.",
-        "rx": "오래 쉬었다 이어갈 때는 새 대화로 시작하고, 대화 중 모델이나 생각 수준을 자주 바꾸지 마세요.",
+        "detail": L(f"입력 {tot['inp']:,} 토큰 중 캐시로 싸게 읽은 비율이에요. 캐시가 깨진 순간이 {len(a['misses'])}번 있었고, "
+                    f"그때 캐시 없이 다시 읽은 양은 {missed:,} 토큰(전체 입력의 {share:.1f}%)이에요.",
+                    f"Share of {tot['inp']:,} input tokens read cheaply from cache. The cache broke {len(a['misses'])} times, "
+                    f"re-reading {missed:,} tokens without it ({share:.1f}% of all input)."),
+        "rx": L("오래 쉬었다 이어갈 때는 새 대화로 시작하고, 대화 중 모델이나 생각 수준을 자주 바꾸지 마세요.",
+                "After a long break, start a new conversation, and avoid switching model or effort mid-conversation."),
         "level": 1 if hit < 0.8 else 0,
     })
 
     reasoning_share = tot["reasoning"] / tot["out"] if tot["out"] else 0
     out.append({
-        "title": "출력 중 생각(추론) 비중",
+        "title": L("출력 중 생각(추론) 비중", "Reasoning share of output"),
         "value": f"{100 * reasoning_share:.0f}%",
-        "detail": f"출력 {tot['out']:,} 토큰 중 AI가 속으로 생각하는 데 쓴 비율이에요.",
-        "rx": "생각 비중이 높으면 생각 수준을 한 단계 낮춰도 결과가 비슷한지 비교해 보세요.",
+        "detail": L(f"출력 {tot['out']:,} 토큰 중 AI가 속으로 생각하는 데 쓴 비율이에요.",
+                    f"Share of {tot['out']:,} output tokens spent on internal reasoning."),
+        "rx": L("생각 비중이 높으면 생각 수준을 한 단계 낮춰도 결과가 비슷한지 비교해 보세요.",
+                "If this is high, try one effort level lower and compare the results."),
         "level": 0,
     })
     return out

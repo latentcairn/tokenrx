@@ -15,6 +15,11 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(HERE, "limits.jsonl")
 LAST = os.path.join(HERE, "limits_last.json")
+LANG = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in ("ko", "en") else "ko"   # 처방이 설치할 때 넘겨 준다
+
+
+def L(ko, en):
+    return ko if LANG == "ko" else en
 
 
 def record(data):
@@ -41,18 +46,18 @@ def record(data):
 
 def status_line(data, snap):
     parts = []
-    names = {"five_hour": "5시간", "seven_day": "주간"}
+    names = {"five_hour": L("5시간", "5h"), "seven_day": L("주간", "week")}
     for k, label in names.items():
         used = (snap.get(k) or {}).get("used_percentage")
         if used is not None:
             parts.append(f"{label} {used:.0f}%")
     ctx = (data.get("context_window") or {}).get("used_percentage")
     if ctx is not None:
-        parts.append(f"맥락 {ctx:.0f}%")
+        parts.append(L(f"맥락 {ctx:.0f}%", f"ctx {ctx:.0f}%"))
     expires = to_epoch((data.get("prompt_cache") or {}).get("expires_at"))
     if expires:
         left = int((expires - time.time()) // 60)
-        parts.append(f"캐시 {left}분 남음" if left > 0 else "캐시 만료")
+        parts.append(L(f"캐시 {left}분 남음", f"cache {left}m left") if left > 0 else L("캐시 만료", "cache expired"))
     return " · ".join(parts)
 
 

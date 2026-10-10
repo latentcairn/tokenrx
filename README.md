@@ -4,13 +4,11 @@ English | [한국어](README.ko.md)
 
 TokenRx reads your local Claude Code and Codex logs and tells you **where your tokens and usage limits went**. It can then fix the settings that cause the waste.
 
-![Sample report (synthetic data)](docs/sample-report.png)
+![Sample report (synthetic data)](docs/sample-report-en.png)
 
 - **Local only.** Nothing leaves your machine, and there is no telemetry.
 - **No conversation content.** It reads token counts and metadata only (model, timestamps, whether a tool was used).
 - **No dependencies.** Python 3.10+ standard library.
-
-> The report and CLI messages are in Korean for now. English output is planned.
 
 ## Quick start
 
@@ -22,6 +20,7 @@ python tokenrx.py
 
 You get a summary in the terminal and a full report at `output/report.html`.
 Use `--days 14` to look at recent usage only.
+The language follows your system (Korean or English); force it with `--lang en` or `--lang ko`, or set `TOKENRX_LANG`.
 
 ## What it diagnoses
 
@@ -60,7 +59,7 @@ python tokenrx.py backups         # list backups
 ## Try it with synthetic data
 
 ```
-python examples/make_sample.py sample-data
+python examples/make_sample.py sample-data en
 python tokenrx.py --claude-home sample-data/claude --codex-home sample-data/codex
 ```
 

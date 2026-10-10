@@ -12,6 +12,7 @@ import os
 import statistics
 
 from .forecast import current, describe, forecast
+from .i18n import L
 
 # 1M 토큰당 API 정가(USD): 입력, 출력, 캐시 저장(5분), 캐시 저장(1시간), 캐시 읽기
 # 구독 사용자는 이 돈을 직접 내지 않지만, 한도를 얼마나 썼는지 비교하는 공통 잣대로 쓴다.
@@ -181,7 +182,7 @@ def analyze(reqs, limits=()):
     by_agent = collections.Counter()
     for r in reqs:
         if r["sidechain"]:
-            by_agent[(r["agent_type"] or "기타", r["model"])] += r["cost"]
+            by_agent[(r["agent_type"] or "other", r["model"])] += r["cost"]
 
     by = {k: collections.Counter() for k in ("model", "project", "entry", "day", "skill", "session")}
     for r in reqs:
@@ -214,11 +215,12 @@ def analyze(reqs, limits=()):
     }
 
 
-CAUSE_LABEL = {
-    "idle": "자리를 비운 사이 캐시 만료",
-    "model": "대화 중 모델 변경",
-    "invalidated": "설정·도구 변경 등으로 캐시 무효화",
-}
+def cause_label(cause):
+    return {
+        "idle": L("자리를 비운 사이 캐시 만료", "Cache expired while idle"),
+        "model": L("대화 중 모델 변경", "Model switched mid-conversation"),
+        "invalidated": L("설정·도구 변경 등으로 캐시 무효화", "Cache invalidated (settings or tools changed)"),
+    }[cause]
 
 
 def pct(x, total):
@@ -232,16 +234,21 @@ def diagnoses(a):
 
     if a["forecast"]:
         for f in a["forecast"]:
-            out.append({"title": "한도 예보", "value": f"{f['used']:.0f}% 사용", "detail": describe(f),
-                        "rx": "", "level": 2 if f["status"] == "danger" else 0})
+            out.append({"title": L("한도 예보", "Limit forecast"),
+                        "value": L(f"{f['used']:.0f}% 사용", f"{f['used']:.0f}% used"),
+                        "detail": describe(f), "rx": "", "level": 2 if f["status"] == "danger" else 0})
     else:
         ratio = a["last7"] / a["weekly_avg"] if a["weekly_avg"] else 0
+        compare = L(f"그 전 4주의 주 평균(${a['weekly_avg']:,.2f})의 {ratio:.1f}배예요. ",
+                    f"That's {ratio:.1f}x your weekly average over the 4 weeks before (${a['weekly_avg']:,.2f}). ")
         out.append({
-            "title": "사용 속도",
-            "value": f"최근 7일 ${a['last7']:,.2f}",
-            "detail": (f"그 전 4주의 주 평균(${a['weekly_avg']:,.2f})의 {ratio:.1f}배예요. " if a["weekly_avg"] else "")
-                      + "Claude Code 기록에는 한도 사용률이 남지 않아서 정확한 예보는 아직 못 해요.",
-            "rx": "한도 기록기를 켜면 5시간·주간 한도를 몇 % 썼는지 기록해서 언제 바닥날지 예보해 드려요.",
+            "title": L("사용 속도", "Usage pace"),
+            "value": L(f"최근 7일 ${a['last7']:,.2f}", f"Last 7 days ${a['last7']:,.2f}"),
+            "detail": (compare if a["weekly_avg"] else "")
+                      + L("Claude Code 기록에는 한도 사용률이 남지 않아서 정확한 예보는 아직 못 해요.",
+                          "Claude Code logs don't record limit usage, so an exact forecast isn't possible yet."),
+            "rx": L("한도 기록기를 켜면 5시간·주간 한도를 몇 % 썼는지 기록해서 언제 바닥날지 예보해 드려요.",
+                    "Turn on the limit recorder to log your 5-hour and weekly limit usage and get a forecast of when you'll run out."),
             "rx_id": "claude-limit-recorder",
             "level": 1 if ratio > 1.5 else 0,
         })
@@ -249,13 +256,18 @@ def diagnoses(a):
     miss_waste = sum(m["waste"] for m in a["misses"])
     idle = [m for m in a["misses"] if m["cause"] == "idle"]
     out.append({
-        "title": "캐시가 깨져서 다시 낸 비용",
+        "title": L("캐시가 깨져서 다시 낸 비용", "Spend lost to cache rebuilds"),
         "value": f"${miss_waste:,.2f} ({pct(miss_waste, total):.1f}%)",
-        "detail": f"대화 맥락을 처음부터 다시 저장한 일이 {len(a['misses'])}번 있었어요. "
-                  f"그중 {len(idle)}번은 자리를 비운 사이 캐시가 만료된 경우예요. "
-                  "캐시 읽기는 아주 싸지만, 다시 저장하면 수십 배 비싸요.",
-        "rx": "자리비움 경고를 켜면, 긴 대화를 1시간 넘게 쉬었다 이어가려 할 때 한 번 멈추고 예상 비용을 알려 드려요. "
-              "대화 도중 모델을 바꾸는 것도 캐시를 처음부터 다시 만들어요.",
+        "detail": L(f"대화 맥락을 처음부터 다시 저장한 일이 {len(a['misses'])}번 있었어요. "
+                    f"그중 {len(idle)}번은 자리를 비운 사이 캐시가 만료된 경우예요. "
+                    "캐시 읽기는 아주 싸지만, 다시 저장하면 수십 배 비싸요.",
+                    f"The full conversation context was re-written to cache {len(a['misses'])} times, "
+                    f"{len(idle)} of them because the cache expired while you were away. "
+                    "Cache reads are cheap; re-writing costs tens of times more."),
+        "rx": L("자리비움 경고를 켜면, 긴 대화를 1시간 넘게 쉬었다 이어가려 할 때 한 번 멈추고 예상 비용을 알려 드려요. "
+                "대화 도중 모델을 바꾸는 것도 캐시를 처음부터 다시 만들어요.",
+                "Turn on the idle guard: when you resume a long conversation after more than an hour, it pauses once "
+                "and shows the estimated cost. Switching models mid-conversation also rebuilds the cache from scratch."),
         "rx_id": "claude-idle-guard",
         "level": 2 if pct(miss_waste, total) > 10 else 1 if pct(miss_waste, total) > 3 else 0,
     })
@@ -264,51 +276,63 @@ def diagnoses(a):
         med = statistics.median(a["start_ctx"])
         start_cost = sum(r["cost"] for r in a["starts"])
         out.append({
-            "title": "대화를 시작할 때마다 드는 고정비",
-            "value": f"대화당 약 {med:,.0f} 토큰",
-            "detail": f"새 대화 {len(a['starts'])}개의 첫 요청이 평균적으로 이만큼을 읽었어요. "
-                      "기본 지시문, 연결된 MCP 도구 설명, 스킬 목록이 여기에 들어가요. "
-                      f"첫 요청들에 쓴 비용은 ${start_cost:,.2f} ({pct(start_cost, total):.1f}%)예요.",
-            "rx": "Claude Code에서 /mcp를 열어 안 쓰는 서버를 끄면 모든 대화의 고정비가 줄어요(설정은 지워지지 않아요).",
+            "title": L("대화를 시작할 때마다 드는 고정비", "Fixed cost of starting a conversation"),
+            "value": L(f"대화당 약 {med:,.0f} 토큰", f"~{med:,.0f} tokens per conversation"),
+            "detail": L(f"새 대화 {len(a['starts'])}개의 첫 요청이 평균적으로 이만큼을 읽었어요. "
+                        "기본 지시문, 연결된 MCP 도구 설명, 스킬 목록이 여기에 들어가요. "
+                        f"첫 요청들에 쓴 비용은 ${start_cost:,.2f} ({pct(start_cost, total):.1f}%)예요.",
+                        f"The first request of each of {len(a['starts'])} conversations read this much on average: "
+                        "the system prompt, MCP tool definitions and the skill list. "
+                        f"Those first requests cost ${start_cost:,.2f} ({pct(start_cost, total):.1f}%)."),
+            "rx": L("Claude Code에서 /mcp를 열어 안 쓰는 서버를 끄면 모든 대화의 고정비가 줄어요(설정은 지워지지 않아요).",
+                    "Open /mcp in Claude Code and turn off servers you don't use. Every conversation gets cheaper, "
+                    "and the server settings are kept."),
             "level": 2 if med > 60_000 else 1 if med > 30_000 else 0,
         })
 
     side = a["side_cost"]
     top_agents = ", ".join(f"{t}·{m.replace('claude-', '')} ${c:,.2f}" for (t, m), c in a["by_agent"].most_common(3))
     out.append({
-        "title": "서브에이전트가 쓴 비용",
+        "title": L("서브에이전트가 쓴 비용", "Subagent spend"),
         "value": f"${side:,.2f} ({pct(side, total):.1f}%)",
-        "detail": f"AI가 일을 나눠 맡긴 작은 AI들이 쓴 비용이에요. 많이 쓴 순서: {top_agents or '없음'}.",
-        "rx": "조사·검색처럼 단순한 일을 맡는 서브에이전트는 Sonnet으로 돌려도 충분한 경우가 많아요.",
+        "detail": L(f"AI가 일을 나눠 맡긴 작은 AI들이 쓴 비용이에요. 많이 쓴 순서: {top_agents or '없음'}.",
+                    f"What the helper agents spent on delegated work. Top: {top_agents or 'none'}."),
+        "rx": L("조사·검색처럼 단순한 일을 맡는 서브에이전트는 Sonnet으로 돌려도 충분한 경우가 많아요.",
+                "Subagents that do simple searching and reading usually do fine on Sonnet."),
         "rx_id": "claude-subagent-sonnet",
         "level": 2 if pct(side, total) > 40 else 1 if pct(side, total) > 20 else 0,
     })
 
     long_cost = sum(r["cost"] for r in a["long"])
     out.append({
-        "title": "너무 길어진 대화",
+        "title": L("너무 길어진 대화", "Oversized conversations"),
         "value": f"${long_cost:,.2f} ({pct(long_cost, total):.1f}%)",
-        "detail": f"맥락이 {LONG_CONTEXT // 1000}K 토큰을 넘은 요청이 {len(a['long'])}번 있었어요. "
-                  "대화가 길수록 질문 한 번에 읽는 양이 커져요.",
-        "rx": "한 가지 일이 끝나면 /compact로 줄이거나 새 대화를 시작하세요.",
+        "detail": L(f"맥락이 {LONG_CONTEXT // 1000}K 토큰을 넘은 요청이 {len(a['long'])}번 있었어요. "
+                    "대화가 길수록 질문 한 번에 읽는 양이 커져요.",
+                    f"{len(a['long'])} requests carried more than {LONG_CONTEXT // 1000}K tokens of context. "
+                    "The longer the conversation, the more every message has to read."),
+        "rx": L("한 가지 일이 끝나면 /compact로 줄이거나 새 대화를 시작하세요.",
+                "When a task is done, run /compact or start a new conversation."),
         "level": 2 if pct(long_cost, total) > 40 else 1 if pct(long_cost, total) > 15 else 0,
     })
 
     out.append({
-        "title": "AI가 생각하고 답하는 데 쓴 비용(출력)",
+        "title": L("AI가 생각하고 답하는 데 쓴 비용(출력)", "Output spend (thinking and answers)"),
         "value": f"${a['out_cost']:,.2f} ({pct(a['out_cost'], total):.1f}%)",
-        "detail": "출력에는 AI의 생각 과정도 들어가요. 출력 토큰은 입력보다 5배 비싸요.",
-        "rx": "간단한 일에는 생각 수준(effort)을 낮추세요.",
+        "detail": L("출력에는 AI의 생각 과정도 들어가요. 출력 토큰은 입력보다 5배 비싸요.",
+                    "Output includes the model's thinking. Output tokens cost 5x input tokens."),
+        "rx": L("간단한 일에는 생각 수준(effort)을 낮추세요.", "Lower the effort level for simple tasks."),
         "level": 1 if pct(a["out_cost"], total) > 40 else 0,
     })
 
     if a["by"]["model"]:
         top_model, top_cost = a["by"]["model"].most_common(1)[0]
         out.append({
-            "title": "가장 많이 쓴 모델",
+            "title": L("가장 많이 쓴 모델", "Top model"),
             "value": f"{top_model.replace('claude-', '')} ({pct(top_cost, total):.0f}%)",
             "detail": ", ".join(f"{m.replace('claude-', '')} ${c:,.2f}" for m, c in a["by"]["model"].most_common()),
-            "rx": "Fable은 Opus 5.5보다 입력·출력 단가가 2.5배예요. 기본 모델을 Opus로 두고 어려운 일에만 Fable을 고르세요.",
+            "rx": L("Fable은 Opus 5.5보다 입력·출력 단가가 2.5배예요. 기본 모델을 Opus로 두고 어려운 일에만 Fable을 고르세요.",
+                    "Fable costs 2.5x Opus 5.5 per token. Make Opus your default and pick Fable only for hard problems."),
             "rx_id": "claude-default-opus",
             "level": 1 if top_model.startswith("claude-fable") and pct(top_cost, total) > 50 else 0,
         })

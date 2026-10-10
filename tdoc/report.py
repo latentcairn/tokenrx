@@ -4,13 +4,19 @@ import datetime as dt
 import html
 import os
 
-from . import __version__
-from .claude import CAUSE_LABEL
+from . import __version__, i18n
+from .claude import cause_label
+from .codex import effort_label
+from .i18n import L, tr
 from .rx import PRESCRIPTIONS
 
-ENTRY_LABEL = {"claude-desktop": "데스크톱 앱", "cli": "터미널", "sdk-py": "자동 실행(파이썬 SDK)",
-               "sdk-ts": "자동 실행(TS SDK)"}
 MARK = {0: "  ", 1: "! ", 2: "!!"}
+
+
+def entry_label(entry):
+    return {"claude-desktop": L("데스크톱 앱", "Desktop app"), "cli": L("터미널", "Terminal"),
+            "sdk-py": L("자동 실행(파이썬 SDK)", "Automation (Python SDK)"),
+            "sdk-ts": L("자동 실행(TS SDK)", "Automation (TS SDK)")}.get(entry, entry or "-")
 
 
 def recommended(diags):
@@ -24,33 +30,37 @@ def recommended(diags):
 
 def print_summary(ca, cdiags, ctitles, xa, xdiags):
     if ca:
-        print(f"\n[Claude Code] {ca['first']:%Y-%m-%d} ~ {ca['last']:%Y-%m-%d}, 요청 {ca['n']:,}건, "
-              f"API 정가 환산 ${ca['total']:,.2f}")
+        print(L(f"\n[Claude Code] {ca['first']:%Y-%m-%d} ~ {ca['last']:%Y-%m-%d}, 요청 {ca['n']:,}건, "
+                f"API 정가 환산 ${ca['total']:,.2f}",
+                f"\n[Claude Code] {ca['first']:%Y-%m-%d} to {ca['last']:%Y-%m-%d}, {ca['n']:,} requests, "
+                f"${ca['total']:,.2f} at API list prices"))
         for d in cdiags:
             print(f"{MARK[d['level']]} {d['title']}: {d['value']}\n     {d['detail']}")
-        print("   캐시가 크게 깨진 순간")
+        print(L("   캐시가 크게 깨진 순간", "   Biggest cache rebuilds"))
         for m in sorted(ca["misses"], key=lambda m: -m["waste"])[:3]:
-            print(f"     ${m['waste']:6,.2f}  {m['ts'].astimezone():%m-%d %H:%M}  {CAUSE_LABEL[m['cause']]}"
-                  f" (공백 {m['gap'] / 60:,.0f}분)  {ctitles.get(m['session']) or ''}")
+            gap = L(f"공백 {m['gap'] / 60:,.0f}분", f"idle {m['gap'] / 60:,.0f} min")
+            print(f"     ${m['waste']:6,.2f}  {m['ts'].astimezone():%m-%d %H:%M}  {cause_label(m['cause'])}"
+                  f" ({gap})  {ctitles.get(m['session']) or ''}")
     if xa and xa.get("n"):
         first = dt.datetime.fromtimestamp(xa["first"])
         last = dt.datetime.fromtimestamp(xa["last"])
-        print(f"\n[Codex] {first:%Y-%m-%d} ~ {last:%Y-%m-%d}, 요청 {xa['n']:,}건")
+        print(L(f"\n[Codex] {first:%Y-%m-%d} ~ {last:%Y-%m-%d}, 요청 {xa['n']:,}건",
+                f"\n[Codex] {first:%Y-%m-%d} to {last:%Y-%m-%d}, {xa['n']:,} requests"))
         for d in xdiags:
             print(f"{MARK[d['level']]} {d['title']}: {d['value']}\n     {d['detail']}")
     rec = recommended(cdiags + xdiags)
     if rec:
-        print("\n추천 처방 (적용: python tokenrx.py apply <이름>)")
+        print(L("\n추천 처방 (적용: python tokenrx.py apply <이름>)", "\nRecommended (apply: python tokenrx.py apply <name>)"))
         for rid in rec:
-            print(f"   {rid:24} {PRESCRIPTIONS[rid]['title']}")
+            print(f"   {rid:24} {tr(PRESCRIPTIONS[rid]['title'])}")
 
 
 def _cards(diags):
     level_name = {0: "ok", 1: "warn", 2: "bad"}
-    level_text = {0: "양호", 1: "주의", 2: "심각"}
+    level_text = {0: L("양호", "OK"), 1: L("주의", "Watch"), 2: L("심각", "Critical")}
     out = []
     for d in diags:
-        rx = f"<p class='rx'><b>처방</b> {html.escape(d['rx'])}</p>" if d.get("rx") else ""
+        rx = f"<p class='rx'><b>{L('처방', 'Fix')}</b> {html.escape(d['rx'])}</p>" if d.get("rx") else ""
         if d.get("rx_id"):
             rx += f"<p class='cmd'><code>python tokenrx.py apply {d['rx_id']}</code></p>"
         out.append(f"<section class='card {level_name[d['level']]}'><div class='tag'>{level_text[d['level']]}</div>"
@@ -97,60 +107,74 @@ th { font-size:13px; color:var(--mute); font-weight:600; }
 
 
 def write_html(path, ca, cdiags, ctitles, xa, xdiags, xtitle_of):
-    parts = [f"<h1>TokenRx 진단서</h1><p class='sub'>v{__version__} · "
-             f"{dt.datetime.now():%Y-%m-%d} 작성</p>"]
+    parts = [f"<h1>{L('TokenRx 진단서', 'TokenRx report')}</h1><p class='sub'>v{__version__} · "
+             f"{dt.datetime.now():%Y-%m-%d}</p>"]
     rec = recommended(cdiags + xdiags)
     rows = []
     for rid, p in PRESCRIPTIONS.items():
-        mark = "<span class='rec'>추천</span>" if rid in rec else ""
-        rows.append(f"<tr><td>{mark}</td><td>{html.escape(p['tool'])}</td><td><b>{html.escape(p['title'])}</b><br>"
-                    f"<small>{html.escape(p['summary'])}</small></td><td><code>python tokenrx.py apply {rid}</code></td></tr>")
-    rx_table = ("<h2>처방</h2><p class='sub'>처방은 항상 원래 설정을 백업한 뒤, 바뀌는 내용을 보여 주고 동의를 받아 적용해요. "
-                "<code>python tokenrx.py undo</code>로 언제든 되돌릴 수 있어요.</p>"
-                f"<div class='wrap rxlist'><table>{''.join(rows)}</table></div>")
+        mark = f"<span class='rec'>{L('추천', 'Recommended')}</span>" if rid in rec else ""
+        rows.append(f"<tr><td>{mark}</td><td>{html.escape(p['tool'])}</td><td><b>{html.escape(tr(p['title']))}</b><br>"
+                    f"<small>{html.escape(tr(p['summary']))}</small></td>"
+                    f"<td><code>python tokenrx.py apply {rid}</code></td></tr>")
+    rx_table = (f"<h2>{L('처방', 'Prescriptions')}</h2><p class='sub'>"
+                + L("처방은 항상 원래 설정을 백업한 뒤, 바뀌는 내용을 보여 주고 동의를 받아 적용해요. "
+                    "<code>python tokenrx.py undo</code>로 언제든 되돌릴 수 있어요.",
+                    "Every prescription backs up your settings, shows the diff and asks before applying. "
+                    "Revert any time with <code>python tokenrx.py undo</code>.")
+                + f"</p><div class='wrap rxlist'><table>{''.join(rows)}</table></div>")
 
     if ca:
         total = ca["total"]
         misses = "\n".join(
-            f"<tr><td>{m['ts'].astimezone():%m-%d %H:%M}</td><td>{html.escape(CAUSE_LABEL[m['cause']])}</td>"
-            f"<td class='num'>{m['gap'] / 60:,.0f}분</td><td class='num'>{m['rebuilt']:,}</td>"
+            f"<tr><td>{m['ts'].astimezone():%m-%d %H:%M}</td><td>{html.escape(cause_label(m['cause']))}</td>"
+            f"<td class='num'>{m['gap'] / 60:,.0f}{L('분', ' min')}</td><td class='num'>{m['rebuilt']:,}</td>"
             f"<td class='num'>${m['waste']:,.2f}</td><td>{html.escape(ctitles.get(m['session']) or '')}</td></tr>"
             for m in sorted(ca["misses"], key=lambda m: -m["waste"])[:12])
+        period = L(f"{ca['first']:%Y-%m-%d} ~ {ca['last']:%Y-%m-%d} · 요청 {ca['n']:,}건 · API 정가 환산",
+                   f"{ca['first']:%Y-%m-%d} to {ca['last']:%Y-%m-%d} · {ca['n']:,} requests · at API list prices")
+        head = (f"<tr><th>{L('시각', 'When')}</th><th>{L('원인', 'Cause')}</th><th class='num'>{L('공백', 'Idle')}</th>"
+                f"<th class='num'>{L('다시 저장한 토큰', 'Tokens re-written')}</th>"
+                f"<th class='num'>{L('추가 비용', 'Extra cost')}</th><th>{L('대화', 'Conversation')}</th></tr>")
         parts.append(
-            f"<h2>Claude Code</h2><p class='sub'>{ca['first']:%Y-%m-%d} ~ {ca['last']:%Y-%m-%d} · 요청 {ca['n']:,}건 · "
-            f"API 정가 환산</p><p class='total'>${total:,.2f}</p><div class='grid'>{_cards(cdiags)}</div>"
-            "<h3>캐시가 크게 깨진 순간</h3><div class='wrap'><table><tr><th>시각</th><th>원인</th><th class='num'>공백</th>"
-            f"<th class='num'>다시 저장한 토큰</th><th class='num'>추가 비용</th><th>대화</th></tr>"
-            f"{misses or '<tr><td colspan=6>없음</td></tr>'}</table></div>"
-            f"<h3>비용이 큰 대화</h3><div class='wrap'><table>"
+            f"<h2>Claude Code</h2><p class='sub'>{period}</p><p class='total'>${total:,.2f}</p>"
+            f"<div class='grid'>{_cards(cdiags)}</div>"
+            f"<h3>{L('캐시가 크게 깨진 순간', 'Biggest cache rebuilds')}</h3><div class='wrap'><table>{head}"
+            f"{misses or '<tr><td colspan=6>-</td></tr>'}</table></div>"
+            f"<h3>{L('비용이 큰 대화', 'Most expensive conversations')}</h3><div class='wrap'><table>"
             f"{_bar_rows(ca['by']['session'].most_common(8), total, lambda s: ctitles.get(s) or s[:8])}</table></div>"
-            f"<h3>모델별</h3><div class='wrap'><table>{_bar_rows(ca['by']['model'].most_common(), total)}</table></div>"
-            f"<h3>실행 방식별</h3><div class='wrap'><table>"
-            f"{_bar_rows(ca['by']['entry'].most_common(), total, lambda e: ENTRY_LABEL.get(e, e))}</table></div>")
+            f"<h3>{L('모델별', 'By model')}</h3><div class='wrap'><table>{_bar_rows(ca['by']['model'].most_common(), total)}</table></div>"
+            f"<h3>{L('실행 방식별', 'By entry point')}</h3><div class='wrap'><table>"
+            f"{_bar_rows(ca['by']['entry'].most_common(), total, entry_label)}</table></div>")
 
     if xa and xa.get("n"):
         wt = xa["weekly_total"] or 1
         first = dt.datetime.fromtimestamp(xa["first"])
         last = dt.datetime.fromtimestamp(xa["last"])
-        pctp = lambda v: f"{v:,.0f}%p"
+        pts = lambda v: L(f"{v:,.0f}%p", f"{v:,.0f} pts")
+        period = L(f"{first:%Y-%m-%d} ~ {last:%Y-%m-%d} · 요청 {xa['n']:,}건 · 주간 한도 누적 소모",
+                   f"{first:%Y-%m-%d} to {last:%Y-%m-%d} · {xa['n']:,} requests · weekly limit used, cumulative")
+        efforts = sorted(((k, v["limit"]) for k, v in xa["by_effort"].items()), key=lambda kv: -kv[1])
         parts.append(
-            f"<h2>Codex</h2><p class='sub'>{first:%Y-%m-%d} ~ {last:%Y-%m-%d} · 요청 {xa['n']:,}건 · "
-            f"주간 한도 누적 소모</p><p class='total'>{xa['weekly_total']:,.0f}%p</p>"
+            f"<h2>Codex</h2><p class='sub'>{period}</p><p class='total'>{pts(xa['weekly_total'])}</p>"
             f"<div class='grid'>{_cards(xdiags)}</div>"
-            f"<h3>주간 한도를 많이 쓴 대화</h3><div class='wrap'><table>"
-            f"{_bar_rows(xa['limit_by_thread'].most_common(8), wt, xtitle_of, pctp)}</table></div>"
-            f"<h3>모델별 주간 한도 소모</h3><div class='wrap'><table>"
-            f"{_bar_rows(xa['limit_by_model'].most_common(), wt, fmt=pctp)}</table></div>"
-            f"<h3>생각 수준별 주간 한도 소모</h3><div class='wrap'><table>"
-            f"{_bar_rows(sorted(((k, v['limit']) for k, v in xa['by_effort'].items()), key=lambda kv: -kv[1]), wt, fmt=pctp)}"
-            "</table></div>")
+            f"<h3>{L('주간 한도를 많이 쓴 대화', 'Threads that used the most weekly limit')}</h3><div class='wrap'><table>"
+            f"{_bar_rows(xa['limit_by_thread'].most_common(8), wt, xtitle_of, pts)}</table></div>"
+            f"<h3>{L('모델별 주간 한도 소모', 'Weekly limit by model')}</h3><div class='wrap'><table>"
+            f"{_bar_rows(xa['limit_by_model'].most_common(), wt, fmt=pts)}</table></div>"
+            f"<h3>{L('생각 수준별 주간 한도 소모', 'Weekly limit by reasoning effort')}</h3><div class='wrap'><table>"
+            f"{_bar_rows(efforts, wt, effort_label, pts)}</table></div>")
 
     parts.append(rx_table)
-    parts.append("<p class='note'>이 진단서는 PC 안에서만 만들어졌어요. 대화 내용은 읽지 않았고, 토큰 수와 기록 정보만 사용했어요. "
-                 "Claude 금액은 API 정가로 환산한 값이라 구독 요금제의 실제 청구액과 달라요. 한도를 얼마나 썼는지 비교하는 잣대로 보세요. "
-                 "Codex의 %p는 주간 한도 사용률이 오른 양을 더한 값이에요(100%p = 주간 한도 1번 분량).</p>")
-    doc = (f"<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
-           f"<meta name='viewport' content='width=device-width, initial-scale=1'><title>TokenRx 진단서</title>"
+    parts.append("<p class='note'>" + L(
+        "이 진단서는 PC 안에서만 만들어졌어요. 대화 내용은 읽지 않았고, 토큰 수와 기록 정보만 사용했어요. "
+        "Claude 금액은 API 정가로 환산한 값이라 구독 요금제의 실제 청구액과 달라요. 한도를 얼마나 썼는지 비교하는 잣대로 보세요. "
+        "Codex의 %p는 주간 한도 사용률이 오른 양을 더한 값이에요(100%p = 주간 한도 1번 분량).",
+        "This report was built entirely on your machine. No conversation content was read, only token counts and metadata. "
+        "Claude amounts are priced at API list rates, not what a subscription bills; use them to compare where your limit went. "
+        "Codex pts add up increases in weekly limit usage (100 pts = one full weekly limit).") + "</p>")
+    doc = (f"<!doctype html><html lang='{i18n.LANG}'><head><meta charset='utf-8'>"
+           f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+           f"<title>{L('TokenRx 진단서', 'TokenRx report')}</title>"
            f"<style>{CSS}</style></head><body><main>{''.join(parts)}</main></body></html>")
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:

@@ -20,6 +20,7 @@ python tokenrx.py
 
 진단 결과가 터미널에 나오고, `output/report.html`에 진단서가 저장돼요.
 최근 며칠만 보려면 `python tokenrx.py --days 14`처럼 실행하세요.
+화면 언어는 PC 설정을 따라 한국어나 영어로 정해져요. 직접 고르려면 `--lang ko`나 `--lang en`을 붙이거나 `TOKENRX_LANG` 환경 변수를 쓰세요.
 
 ## 무엇을 진단하나요
 
@@ -54,7 +55,7 @@ python tokenrx.py backups            # 백업 목록
 ## 가짜 데이터로 시험하기
 
 ```
-python examples/make_sample.py sample-data
+python examples/make_sample.py sample-data ko
 python tokenrx.py --claude-home sample-data/claude --codex-home sample-data/codex
 ```
 
@@ -63,7 +64,6 @@ python tokenrx.py --claude-home sample-data/claude --codex-home sample-data/code
 - **기록 형식이 바뀔 수 있어요.** Claude Code 기록 형식은 공식 문서가 없고 버전마다 바뀔 수 있어요. 모르는 줄은 건너뛰어요.
 - **Codex는 처음 한 번만 오래 걸려요.** 기록이 수 GB면 처음에 1분 정도 걸릴 수 있어요. 그다음부터는 `cache/`에 정리해 둔 결과로 몇 초면 끝나요.
 - **한도 기록기는 조건이 있어요.** Claude 구독(Pro·Max)에서, 상태 표시줄이 보이는 화면에서만 기록돼요.
-- **화면은 아직 한국어만 지원해요.**
 
 ## 라이선스
 

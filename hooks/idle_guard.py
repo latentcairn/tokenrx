@@ -17,6 +17,11 @@ THRESHOLD_TOKENS = 100_000   # 이보다 짧은 대화는 다시 저장해도 �
 CONFIRM_WINDOW = 600         # 경고 뒤 이 시간(초) 안에 다시 보내면 그대로 진행
 TAIL_BYTES = 4_000_000       # 기록 파일 끝에서 이만큼만 읽는다
 STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "idle_guard_state.json")
+LANG = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in ("ko", "en") else "ko"   # 처방이 설치할 때 넘겨 준다
+
+
+def L(ko, en):
+    return ko if LANG == "ko" else en
 
 # 1M 토큰당 캐시 저장(5분), 캐시 저장(1시간), 캐시 읽기 가격(USD)
 CACHE_PRICES = {
@@ -73,10 +78,10 @@ def last_request(transcript):
 def elapsed(seconds):
     minutes = int(seconds // 60)
     if minutes >= 1440:
-        return f"{minutes // 1440}일"
+        return L(f"{minutes // 1440}일", f"{minutes // 1440} days")
     if minutes >= 60:
-        return f"{minutes // 60}시간 {minutes % 60}분"
-    return f"{minutes}분"
+        return L(f"{minutes // 60}시간 {minutes % 60}분", f"{minutes // 60}h {minutes % 60}m")
+    return L(f"{minutes}분", f"{minutes} min")
 
 
 def load_state():
@@ -117,12 +122,18 @@ def main():
     save_state(state)
 
     price = cache_price(model)
-    cost = f"API 정가로 약 ${context * (price[1 if ttl == 3600 else 0] - price[2]) / 1e6:,.2f}어치, " if price else ""
-    reason = (
+    usd = f"${context * (price[1 if ttl == 3600 else 0] - price[2]) / 1e6:,.2f}" if price else ""
+    reason = L(
         f"[TokenRx] 잠깐만요. 이 대화는 {context:,} 토큰 길이인데, 마지막 응답 뒤 {elapsed(gap)}이 지나 캐시가 만료됐어요. "
-        f"이대로 이어가면 대화 전체를 다시 저장해서 한도를 크게 써요({cost}캐시가 살아 있을 때보다 수십 배). "
+        f"이대로 이어가면 대화 전체를 다시 저장해서 한도를 크게 써요({'API 정가로 약 ' + usd + '어치, ' if usd else ''}"
+        "캐시가 살아 있을 때보다 수십 배). "
         "아끼려면: /compact 로 대화를 줄인 뒤 보내거나, 요약을 부탁해 새 대화로 옮기세요. "
-        "그래도 이어가려면 같은 메시지를 10분 안에 다시 보내세요."
+        "그래도 이어가려면 같은 메시지를 10분 안에 다시 보내세요.",
+        f"[TokenRx] Hold on. This conversation is {context:,} tokens long, and {elapsed(gap)} have passed since the "
+        f"last reply, so its cache has expired. Continuing now re-writes the whole context and eats a big chunk of your limit "
+        f"({'about ' + usd + ' at API list prices, ' if usd else ''}tens of times more than with a warm cache). "
+        "To save it: run /compact first, or ask for a summary and continue in a new conversation. "
+        "To continue anyway, send the same message again within 10 minutes.",
     )
     print(json.dumps({"decision": "block", "reason": reason}))   # ensure_ascii 기본값으로 인코딩 문제를 피한다
 

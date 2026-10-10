@@ -11,6 +11,9 @@ import re
 import shutil
 import sys
 
+from . import i18n
+from .i18n import L
+
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -47,11 +50,11 @@ def _json_change(path, mutate):
     try:
         data = json.loads(old) if old and old.strip() else {}
     except ValueError:
-        raise RxError(f"{path} 파일 형식이 올바르지 않아서 건드리지 않았어요.")
+        raise RxError(L(f"{path} 파일 형식이 올바르지 않아서 건드리지 않았어요.", f"{path} isn't valid JSON, so it was left untouched."))
     mutate(data)
     new = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     if new == old:
-        raise RxError("이미 적용되어 있어요.")
+        raise RxError(_already())
     return (path, old, new)
 
 
@@ -61,8 +64,13 @@ def _copy_change(src_name, dest):
     return (dest, _read(dest), new)
 
 
+def _already():
+    return L("이미 적용되어 있어요.", "Already applied.")
+
+
 def _command(env, script):
-    return f'"{env.python}" "{script.replace(os.sep, "/")}"'
+    """훅 명령. 화면 언어를 인자로 넘겨 경고 문구도 같은 언어로 나오게 한다."""
+    return f'"{env.python}" "{script.replace(os.sep, "/")}" {i18n.LANG}'
 
 
 def plan_idle_guard(env):
@@ -71,7 +79,7 @@ def plan_idle_guard(env):
     def mutate(d):
         groups = d.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
         if any("idle_guard.py" in h.get("command", "") for g in groups for h in g.get("hooks", [])):
-            raise RxError("이미 적용되어 있어요.")
+            raise RxError(_already())
         groups.append({"hooks": [{"type": "command", "command": _command(env, dest)}]})
     return [_copy_change("idle_guard.py", dest), _json_change(env.settings, mutate)]
 
@@ -82,9 +90,9 @@ def plan_limit_recorder(env):
     def mutate(d):
         cur = d.get("statusLine")
         if cur and "limit_recorder.py" in json.dumps(cur):
-            raise RxError("이미 적용되어 있어요.")
+            raise RxError(_already())
         if cur:
-            raise RxError("이미 다른 상태 표시줄을 쓰고 있어서 덮어쓰지 않았어요.")
+            raise RxError(L("이미 다른 상태 표시줄을 쓰고 있어서 덮어쓰지 않았어요.", "You already have another status line, so it wasn't overwritten."))
         d["statusLine"] = {"type": "command", "command": _command(env, dest), "padding": 0}
     return [_copy_change("limit_recorder.py", dest), _json_change(env.settings, mutate)]
 
@@ -105,7 +113,7 @@ def plan_codex_effort_high(env):
     path = os.path.join(env.codex_home, "config.toml")
     old = _read(path)
     if old is None:
-        raise RxError("Codex 설정 파일(config.toml)을 찾지 못했어요.")
+        raise RxError(L("Codex 설정 파일(config.toml)을 찾지 못했어요.", "Couldn't find the Codex config file (config.toml)."))
     lines = old.splitlines(keepends=True)
     first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
     pat = re.compile(r'^\s*model_reasoning_effort\s*=')
@@ -114,40 +122,48 @@ def plan_codex_effort_high(env):
     if idx is None:
         lines.insert(0, new_line)
     elif lines[idx].strip() == new_line.strip():
-        raise RxError("이미 적용되어 있어요.")
+        raise RxError(_already())
     else:
         lines[idx] = new_line
     return [(path, old, "".join(lines))]
 
 
-PRESCRIPTIONS = {
+PRESCRIPTIONS = {   # title, summary는 (한국어, English)
     "claude-idle-guard": {
-        "tool": "Claude Code", "title": "자리비움 경고 켜기",
-        "summary": "긴 대화를 캐시 만료 뒤에 이어가려 할 때 한 번 멈추고 예상 비용을 알려 줘요. "
-                   "같은 메시지를 10분 안에 다시 보내면 그대로 진행돼요. 새 대화부터 적용돼요.",
-        "plan": plan_idle_guard,
+        "tool": "Claude Code", "plan": plan_idle_guard,
+        "title": ("자리비움 경고 켜기", "Turn on the idle guard"),
+        "summary": ("긴 대화를 캐시 만료 뒤에 이어가려 할 때 한 번 멈추고 예상 비용을 알려 줘요. "
+                    "같은 메시지를 10분 안에 다시 보내면 그대로 진행돼요. 새 대화부터 적용돼요.",
+                    "When you resume a long conversation after its cache expired, it pauses once and shows the "
+                    "estimated cost. Send the same message again within 10 minutes to go ahead. Applies to new sessions."),
     },
     "claude-limit-recorder": {
-        "tool": "Claude Code", "title": "한도 기록기 켜기",
-        "summary": "상태 표시줄에 5시간·주간 한도 사용률과 캐시 남은 시간을 보여 주고, 한도 사용률을 PC에 기록해요. "
-                   "이 기록으로 언제 한도에 닿을지 예보해요. Claude 구독(Pro·Max)에서 동작하고, 상태 표시줄이 보이는 화면에서만 기록돼요.",
-        "plan": plan_limit_recorder,
+        "tool": "Claude Code", "plan": plan_limit_recorder,
+        "title": ("한도 기록기 켜기", "Turn on the limit recorder"),
+        "summary": ("상태 표시줄에 5시간·주간 한도 사용률과 캐시 남은 시간을 보여 주고, 한도 사용률을 PC에 기록해요. "
+                    "이 기록으로 언제 한도에 닿을지 예보해요. Claude 구독(Pro·Max)에서 동작하고, 상태 표시줄이 보이는 화면에서만 기록돼요.",
+                    "Shows 5-hour and weekly limit usage and time left on the cache in the status line, and logs limit "
+                    "usage locally for forecasts. Needs a Claude Pro or Max plan and only records where the status line is shown."),
     },
     "claude-subagent-sonnet": {
-        "tool": "Claude Code", "title": "서브에이전트를 Sonnet으로",
-        "summary": "AI가 일을 나눠 맡길 때 쓰는 기본 모델을 Sonnet으로 바꿔요. "
-                   "따로 모델이 정해진 서브에이전트(Explore 등)는 그대로예요.",
-        "plan": plan_subagent_sonnet,
+        "tool": "Claude Code", "plan": plan_subagent_sonnet,
+        "title": ("서브에이전트를 Sonnet으로", "Run subagents on Sonnet"),
+        "summary": ("AI가 일을 나눠 맡길 때 쓰는 기본 모델을 Sonnet으로 바꿔요. "
+                    "따로 모델이 정해진 서브에이전트(Explore 등)는 그대로예요.",
+                    "Sets the default model for delegated subagents to Sonnet. "
+                    "Subagents with their own model setting (such as Explore) are unchanged."),
     },
     "claude-default-opus": {
-        "tool": "Claude Code", "title": "기본 모델을 Opus로",
-        "summary": "새 대화의 기본 모델을 Opus로 바꿔요. 필요할 때는 언제든 /model로 Fable을 고를 수 있어요.",
-        "plan": plan_default_opus,
+        "tool": "Claude Code", "plan": plan_default_opus,
+        "title": ("기본 모델을 Opus로", "Make Opus the default model"),
+        "summary": ("새 대화의 기본 모델을 Opus로 바꿔요. 필요할 때는 언제든 /model로 Fable을 고를 수 있어요.",
+                    "New conversations start on Opus. You can still pick Fable with /model whenever you need it."),
     },
     "codex-effort-high": {
-        "tool": "Codex", "title": "Codex 기본 생각 수준을 high로",
-        "summary": "Codex의 기본 생각 수준(model_reasoning_effort)을 high로 바꿔요. 어려운 일에는 대화에서 ultra를 고르면 돼요.",
-        "plan": plan_codex_effort_high,
+        "tool": "Codex", "plan": plan_codex_effort_high,
+        "title": ("Codex 기본 생각 수준을 high로", "Set Codex default effort to high"),
+        "summary": ("Codex의 기본 생각 수준(model_reasoning_effort)을 high로 바꿔요. 어려운 일에는 대화에서 ultra를 고르면 돼요.",
+                    "Sets Codex model_reasoning_effort to high. Pick ultra in the conversation for hard problems."),
     },
 }
 
@@ -157,9 +173,9 @@ def preview(changes):
     out = []
     for path, old, new in changes:
         if old is None:
-            out.append(f"+ 새 파일: {path}")
+            out.append(L(f"+ 새 파일: {path}", f"+ new file: {path}"))
             continue
-        diff = difflib.unified_diff(old.splitlines(), new.splitlines(), fromfile=path, tofile=path + " (처방 후)",
+        diff = difflib.unified_diff(old.splitlines(), new.splitlines(), fromfile=path, tofile=path + L(" (처방 후)", " (after)"),
                                     lineterm="", n=2)
         out.append("\n".join(diff))
     return "\n\n".join(out)
@@ -206,18 +222,19 @@ def undo(env, name=None):
     """가장 최근(또는 지정한) 처방을 되돌린다. 되돌린 백업 이름을 돌려준다."""
     backups = list_backups(env)
     if not backups:
-        raise RxError("되돌릴 처방이 없어요.")
+        raise RxError(L("되돌릴 처방이 없어요.", "Nothing to undo."))
     if name:
         match = [b for b in backups if b[0] == name]
         if not match:
-            raise RxError(f"{name} 백업을 찾지 못했어요.")
+            raise RxError(L(f"{name} 백업을 찾지 못했어요.", f"Backup {name} not found."))
         name, m = match[0]
     else:
         name, m = backups[-1]
     paths = {e["path"] for e in m["files"]}
     later = [n for n, lm in backups if n > name and paths & {e["path"] for e in lm["files"]}]
     if later:
-        raise RxError(f"나중에 적용한 처방({', '.join(later)})이 같은 파일을 바꿨어요. 그것부터 되돌려 주세요.")
+        raise RxError(L(f"나중에 적용한 처방({', '.join(later)})이 같은 파일을 바꿨어요. 그것부터 되돌려 주세요.",
+                         f"A later prescription ({', '.join(later)}) changed the same file. Undo that one first."))
     bdir = os.path.join(env.backups, name)
     for entry in m["files"]:
         if entry["existed"]:
