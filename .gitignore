@@ -1,0 +1,8 @@
+# 사용자 PC의 기록에서 만든 결과물(개인 정보가 들어 있음)
+output/
+cache/
+backups/
+__pycache__/
+hooks/*.json
+hooks/*.jsonl
+sample-data/
