@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """TokenRx(토큰 처방전): Claude Code·Codex 사용 기록을 읽어 토큰과 한도가 어디로 샜는지 진단하고 처방한다.
 
-PC 안에서만 동작하고 인터넷에 아무것도 보내지 않는다. 대화 내용은 읽지 않는다.
+PC 안에서만 동작하고 인터넷에 아무것도 보내지 않는다. 진단은 대화 내용을 읽지 않는다
+(자리비움 경고 훅만 인수인계 메모를 만들 때 최근 대화를 PC 안에서 읽는다).
 
 사용법 / Usage:
     python tokenrx.py                       진단하고 진단서(output/report.html) 만들기 / diagnose and write the report
@@ -18,7 +19,7 @@ import hashlib
 import os
 import sys
 
-from tdoc import claude, codex, i18n, report, rx
+from tdoc import claude, codex, effect, i18n, report, rx, savings
 from tdoc.i18n import L, tr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,12 +29,13 @@ def check(args):
     ca = cdiags = None
     ctitles = {}
     if os.path.isdir(os.path.join(args.claude_home, "projects")):
-        reqs, ctitles = claude.load(args.claude_home)
+        reqs, ctitles, api_errors = claude.load(args.claude_home)
         if args.days:
             since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.days)
             reqs = [r for r in reqs if r["ts"] >= since]
+            api_errors = [e for e in api_errors if e["ts"] >= since]
         if reqs:
-            ca = claude.analyze(reqs, claude.load_limits(args.claude_home))
+            ca = claude.analyze(reqs, claude.load_limits(args.claude_home), api_errors)
             cdiags = claude.diagnoses(ca)
 
     xa, xdiags = None, []
@@ -43,17 +45,28 @@ def check(args):
         if not os.path.exists(cache):
             print(L("Codex 기록을 처음 읽는 중이에요. 기록이 많으면 1분 정도 걸려요...",
                     "Reading Codex logs for the first time. Large logs can take about a minute..."), flush=True)
-        reqs, limits, threads, titles = codex.load(args.codex_home, cache)
-        xa = codex.analyze(reqs, limits, threads, titles, days=args.days)
+        reqs, limits, threads, titles, turns = codex.load(args.codex_home, cache)
+        xa = codex.analyze(reqs, limits, threads, titles, days=args.days, turns=turns)
         xdiags = codex.diagnoses(xa)
+
+    effects = []
+    if ca:
+        sv = savings.claude_savings(ca)
+        for d in cdiags:
+            d["saving"] = savings.describe(sv.get(d.get("rx_id")))
+        effects = effect.claude_effects(ca, effect.applied(env_of(args).backups))
+    if xa and xa.get("n"):
+        sv = savings.codex_savings(xa)
+        for d in xdiags:
+            d["saving"] = savings.describe(sv.get(d.get("rx_id")), kind="codex")
 
     if not ca and not (xa and xa.get("n")):
         print(L("분석할 기록이 없어요. Claude Code나 Codex를 쓴 적이 있는지, 기록 폴더 경로가 맞는지 확인하세요.",
                 "No logs to analyze. Check that you've used Claude Code or Codex and that the log folders are right."))
         return 1
-    report.print_summary(ca, cdiags or [], ctitles, xa, xdiags)
+    report.print_summary(ca, cdiags or [], ctitles, xa, xdiags, effects)
     report.write_html(args.out, ca, cdiags or [], ctitles, xa, xdiags,
-                      (lambda t: codex.title_of(xa, t)) if xa else str)
+                      (lambda t: codex.title_of(xa, t)) if xa else str, effects)
     print(L(f"\n진단서 저장: {os.path.abspath(args.out)}", f"\nReport saved: {os.path.abspath(args.out)}"))
     return 0
 

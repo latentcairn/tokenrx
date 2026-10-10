@@ -15,6 +15,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(HERE, "limits.jsonl")
 LAST = os.path.join(HERE, "limits_last.json")
+NUDGE_MINUTES = 10       # 캐시가 이만큼 남으면 떠나기 전 /compact를 권한다
+NUDGE_TOKENS = 100_000   # 이보다 짧은 대화는 다시 저장해도 부담이 작다
 LANG = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in ("ko", "en") else "ko"   # 처방이 설치할 때 넘겨 준다
 
 
@@ -58,7 +60,18 @@ def status_line(data, snap):
     if expires:
         left = int((expires - time.time()) // 60)
         parts.append(L(f"캐시 {left}분 남음", f"cache {left}m left") if left > 0 else L("캐시 만료", "cache expired"))
+        if 0 < left <= NUDGE_MINUTES and context_tokens(data) >= NUDGE_TOKENS:
+            parts.append(L("자리를 비울 거면 지금 /compact", "stepping away? /compact now"))
     return " · ".join(parts)
+
+
+def context_tokens(data):
+    """지금 대화 맥락의 토큰 수. 창 크기를 모르면 사용률 20%를 기준선 크기로 본다."""
+    cw = data.get("context_window") or {}
+    used, size = cw.get("used_percentage"), cw.get("context_window_size")
+    if used is None:
+        return 0
+    return used * size / 100 if size else (NUDGE_TOKENS if used >= 20 else 0)
 
 
 def to_epoch(v):

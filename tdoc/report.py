@@ -5,9 +5,10 @@ import html
 import os
 
 from . import __version__, i18n
-from .claude import cause_label
-from .codex import effort_label
+from .claude import cause_label, tool_cat_label
+from .codex import bad_mcp, cmd_cat_label, effort_label
 from .i18n import L, tr
+from .effect import describe as describe_effect
 from .rx import PRESCRIPTIONS
 
 MARK = {0: "  ", 1: "! ", 2: "!!"}
@@ -28,7 +29,7 @@ def recommended(diags):
     return out
 
 
-def print_summary(ca, cdiags, ctitles, xa, xdiags):
+def print_summary(ca, cdiags, ctitles, xa, xdiags, effects=()):
     if ca:
         print(L(f"\n[Claude Code] {ca['first']:%Y-%m-%d} ~ {ca['last']:%Y-%m-%d}, 요청 {ca['n']:,}건, "
                 f"API 정가 환산 ${ca['total']:,.2f}",
@@ -36,6 +37,8 @@ def print_summary(ca, cdiags, ctitles, xa, xdiags):
                 f"${ca['total']:,.2f} at API list prices"))
         for d in cdiags:
             print(f"{MARK[d['level']]} {d['title']}: {d['value']}\n     {d['detail']}")
+            if d.get("saving"):
+                print(f"     → {d['saving']}")
         print(L("   캐시가 크게 깨진 순간", "   Biggest cache rebuilds"))
         for m in sorted(ca["misses"], key=lambda m: -m["waste"])[:3]:
             gap = L(f"공백 {m['gap'] / 60:,.0f}분", f"idle {m['gap'] / 60:,.0f} min")
@@ -48,11 +51,17 @@ def print_summary(ca, cdiags, ctitles, xa, xdiags):
                 f"\n[Codex] {first:%Y-%m-%d} to {last:%Y-%m-%d}, {xa['n']:,} requests"))
         for d in xdiags:
             print(f"{MARK[d['level']]} {d['title']}: {d['value']}\n     {d['detail']}")
+            if d.get("saving"):
+                print(f"     → {d['saving']}")
     rec = recommended(cdiags + xdiags)
     if rec:
         print(L("\n추천 처방 (적용: python tokenrx.py apply <이름>)", "\nRecommended (apply: python tokenrx.py apply <name>)"))
         for rid in rec:
             print(f"   {rid:24} {tr(PRESCRIPTIONS[rid]['title'])}")
+    if effects:
+        print(L("\n처방 효과 (적용 전후 비교)", "\nPrescription effects (before vs after)"))
+        for e in effects:
+            print(f"   {e['rx']:24} {describe_effect(e)}")
 
 
 def _cards(diags):
@@ -61,6 +70,8 @@ def _cards(diags):
     out = []
     for d in diags:
         rx = f"<p class='rx'><b>{L('처방', 'Fix')}</b> {html.escape(d['rx'])}</p>" if d.get("rx") else ""
+        if d.get("saving"):
+            rx += f"<p class='saving'>{html.escape(d['saving'])}</p>"
         if d.get("rx_id"):
             rx += f"<p class='cmd'><code>python tokenrx.py apply {d['rx_id']}</code></p>"
         out.append(f"<section class='card {level_name[d['level']]}'><div class='tag'>{level_text[d['level']]}</div>"
@@ -79,6 +90,33 @@ def _bar_rows(items, total, label=lambda k: k, fmt=lambda v: f"${v:,.2f}"):
     return "\n".join(rows)
 
 
+def _count(v):
+    return f"{v:,}"
+
+
+def _failure_tables(cats, n_fail, label, title, mcp=None):
+    """실패 원인 표와 MCP 서버별 실패율 표. 실패가 없으면 빈 문자열."""
+    if not n_fail and not mcp:
+        return ""
+    out = ""
+    if n_fail:
+        out += (f"<h3>{title}</h3><div class='wrap'><table>"
+                f"{_bar_rows(cats.most_common(6), n_fail, label, _count)}</table></div>")
+    if mcp:
+        flagged = {s for s, n, f in bad_mcp({'mcp': mcp})}
+        rows = []
+        for s, (n, f) in sorted(mcp.items(), key=lambda kv: -kv[1][0])[:8]:
+            rate = 100 * f / n if n else 0
+            mark = " class='bad'" if s in flagged else ""
+            rows.append(f"<tr><td>{html.escape(s)}</td><td class='num'>{f:,} / {n:,}</td>"
+                        f"<td class='bar'><span style='width:{min(rate, 100):.1f}%'></span></td>"
+                        f"<td class='num'{mark}>{rate:.1f}%</td></tr>")
+        out += (f"<h3>{L('MCP 서버별 실패율', 'MCP failure rate by server')}</h3><div class='wrap'><table>"
+                f"<tr><th>{L('서버', 'Server')}</th><th class='num'>{L('실패 / 호출', 'Failed / calls')}</th>"
+                f"<th></th><th class='num'>{L('실패율', 'Rate')}</th></tr>{''.join(rows)}</table></div>")
+    return out
+
+
 CSS = """
 :root { --bg:#f6f5f2; --card:#fff; --ink:#1d1d1f; --mute:#6b6b70; --line:#e4e2dc; --ok:#2e7d5b; --warn:#b7791f; --bad:#c0392b; --barc:#4a6cf7; --code:#f0eee8; }
 @media (prefers-color-scheme: dark) { :root { --bg:#141416; --card:#1e1e22; --ink:#ececf0; --mute:#9a9aa3; --line:#2e2e34; --barc:#7b93ff; --code:#2a2a30; } }
@@ -92,7 +130,7 @@ h1 { font-size:26px; margin:0 0 4px; } h2 { font-size:20px; margin:40px 0 12px; 
 .card { background:var(--card); border:1px solid var(--line); border-left:5px solid var(--ok); border-radius:12px; padding:16px 18px; }
 .card.warn { border-left-color:var(--warn); } .card.bad { border-left-color:var(--bad); }
 .card h3 { margin:4px 0; } .card p { margin:6px 0; }
-.value { font-size:21px; font-weight:700; } .rx { color:var(--mute); }
+.value { font-size:21px; font-weight:700; } .rx { color:var(--mute); } .saving { font-weight:600; }
 .cmd code, .rxlist code { background:var(--code); padding:2px 6px; border-radius:6px; font-size:13px; }
 .tag { font-size:12px; font-weight:700; color:var(--ok); } .warn .tag { color:var(--warn); } .bad .tag { color:var(--bad); }
 table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
@@ -102,11 +140,12 @@ th { font-size:13px; color:var(--mute); font-weight:600; }
 .bar { width:38%; } .bar span { display:block; height:10px; border-radius:5px; background:var(--barc); }
 .wrap { overflow-x:auto; margin-bottom:14px; }
 .rxlist .rec { font-weight:700; color:var(--bad); }
+td.bad { color:var(--bad); font-weight:700; }
 .note { color:var(--mute); font-size:13px; margin-top:32px; }
 """
 
 
-def write_html(path, ca, cdiags, ctitles, xa, xdiags, xtitle_of):
+def write_html(path, ca, cdiags, ctitles, xa, xdiags, xtitle_of, effects=()):
     parts = [f"<h1>{L('TokenRx 진단서', 'TokenRx report')}</h1><p class='sub'>v{__version__} · "
              f"{dt.datetime.now():%Y-%m-%d}</p>"]
     rec = recommended(cdiags + xdiags)
@@ -138,6 +177,9 @@ def write_html(path, ca, cdiags, ctitles, xa, xdiags, xtitle_of):
         parts.append(
             f"<h2>Claude Code</h2><p class='sub'>{period}</p><p class='total'>${total:,.2f}</p>"
             f"<div class='grid'>{_cards(cdiags)}</div>"
+            + (_failure_tables(ca["tool_errors"]["fails"], ca["tool_errors"]["n_fail"], tool_cat_label,
+                               L("도구가 실패한 원인", "Why tool calls failed"))
+               if ca.get("tool_errors") else "") +
             f"<h3>{L('캐시가 크게 깨진 순간', 'Biggest cache rebuilds')}</h3><div class='wrap'><table>{head}"
             f"{misses or '<tr><td colspan=6>-</td></tr>'}</table></div>"
             f"<h3>{L('비용이 큰 대화', 'Most expensive conversations')}</h3><div class='wrap'><table>"
@@ -157,6 +199,9 @@ def write_html(path, ca, cdiags, ctitles, xa, xdiags, xtitle_of):
         parts.append(
             f"<h2>Codex</h2><p class='sub'>{period}</p><p class='total'>{pts(xa['weekly_total'])}</p>"
             f"<div class='grid'>{_cards(xdiags)}</div>"
+            + (_failure_tables(xa["errors"]["cats"], xa["errors"]["fails"], cmd_cat_label,
+                               L("명령이 실패한 원인", "Why commands failed"), xa["errors"]["mcp"])
+               if xa.get("errors") else "") +
             f"<h3>{L('주간 한도를 많이 쓴 대화', 'Threads that used the most weekly limit')}</h3><div class='wrap'><table>"
             f"{_bar_rows(xa['limit_by_thread'].most_common(8), wt, xtitle_of, pts)}</table></div>"
             f"<h3>{L('모델별 주간 한도 소모', 'Weekly limit by model')}</h3><div class='wrap'><table>"
@@ -164,12 +209,21 @@ def write_html(path, ca, cdiags, ctitles, xa, xdiags, xtitle_of):
             f"<h3>{L('생각 수준별 주간 한도 소모', 'Weekly limit by reasoning effort')}</h3><div class='wrap'><table>"
             f"{_bar_rows(efforts, wt, effort_label, pts)}</table></div>")
 
+    if effects:
+        rows = "".join(f"<tr><td><code>{html.escape(e['rx'])}</code></td><td>{e['start']:%Y-%m-%d}</td>"
+                       f"<td>{html.escape(describe_effect(e))}</td></tr>" for e in effects)
+        parts.append(f"<h2>{L('처방 효과', 'Prescription effects')}</h2><p class='sub'>"
+                     + L("처방을 적용하기 전 30일과 적용한 뒤 14일 동안, 그 처방이 겨냥한 낭비가 전체에서 차지한 비중을 비교해요.",
+                         "Compares the share of spend the prescription targets in the 30 days before and the 14 days after it was applied.")
+                     + f"</p><div class='wrap'><table>{rows}</table></div>")
     parts.append(rx_table)
     parts.append("<p class='note'>" + L(
         "이 진단서는 PC 안에서만 만들어졌어요. 대화 내용은 읽지 않았고, 토큰 수와 기록 정보만 사용했어요. "
+        "실패 원인을 나눌 때만 오류 메시지 앞부분을 훑어봤고, 그 내용은 저장하거나 보여 주지 않아요. "
         "Claude 금액은 API 정가로 환산한 값이라 구독 요금제의 실제 청구액과 달라요. 한도를 얼마나 썼는지 비교하는 잣대로 보세요. "
         "Codex의 %p는 주간 한도 사용률이 오른 양을 더한 값이에요(100%p = 주간 한도 1번 분량).",
         "This report was built entirely on your machine. No conversation content was read, only token counts and metadata. "
+        "To sort failures by cause, only the start of each error message was scanned; it is never stored or shown. "
         "Claude amounts are priced at API list rates, not what a subscription bills; use them to compare where your limit went. "
         "Codex pts add up increases in weekly limit usage (100 pts = one full weekly limit).") + "</p>")
     doc = (f"<!doctype html><html lang='{i18n.LANG}'><head><meta charset='utf-8'>"

@@ -10,11 +10,15 @@ import os
 import re
 import shutil
 import sys
+import time
 
 from . import i18n
+from .codex import detect_shell
 from .i18n import L
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHELL_START = "<!-- tokenrx:shell-notes -->"   # Codex 지시 파일에 덧붙이는 셸 요령의 시작·끝 표시
+SHELL_END = "<!-- /tokenrx:shell-notes -->"
 
 
 class RxError(Exception):
@@ -73,14 +77,20 @@ def _command(env, script):
     return f'"{env.python}" "{script.replace(os.sep, "/")}" {i18n.LANG}'
 
 
+AUTOCOMPACT_WINDOW = 400_000   # savings.COMPACT_WINDOW와 같아야 한다
+
+
 def plan_idle_guard(env):
     dest = os.path.join(env.tool_dir, "idle_guard.py")
 
     def mutate(d):
-        groups = d.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
-        if any("idle_guard.py" in h.get("command", "") for g in groups for h in g.get("hooks", [])):
+        hooks = d.setdefault("hooks", {})
+        if any("idle_guard.py" in h.get("command", "")
+               for g in hooks.get("UserPromptSubmit", []) for h in g.get("hooks", [])):
             raise RxError(_already())
-        groups.append({"hooks": [{"type": "command", "command": _command(env, dest)}]})
+        # 같은 스크립트가 새 대화 시작(SessionStart)도 받아서, 방금 남긴 인수인계 메모를 새 대화에 알린다
+        for event in ("UserPromptSubmit", "SessionStart"):
+            hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": _command(env, dest)}]})
     return [_copy_change("idle_guard.py", dest), _json_change(env.settings, mutate)]
 
 
@@ -100,6 +110,15 @@ def plan_limit_recorder(env):
 def plan_subagent_sonnet(env):
     def mutate(d):
         d.setdefault("env", {})["CLAUDE_CODE_SUBAGENT_MODEL"] = "sonnet"
+    return [_json_change(env.settings, mutate)]
+
+
+def plan_autocompact(env):
+    def mutate(d):
+        cur = d.get("autoCompactWindow")
+        if isinstance(cur, int) and cur <= AUTOCOMPACT_WINDOW:
+            raise RxError(_already())
+        d["autoCompactWindow"] = AUTOCOMPACT_WINDOW
     return [_json_change(env.settings, mutate)]
 
 
@@ -128,14 +147,68 @@ def plan_codex_effort_high(env):
     return [(path, old, "".join(lines))]
 
 
+def shell_notes(shell, windows=True):
+    """Codex에게 줄 셸 사용 요령. 모델이 읽으므로 영어로, 80토큰 안팎으로 짧게."""
+    if shell == "pwsh":
+        lines = ["Shell: PowerShell 7 (pwsh)" + (" on Windows." if windows else "."),
+                 "- Keep braces and quotes balanced; put long multi-line logic in a script file."]
+    else:
+        lines = ["Shell: Windows PowerShell 5.1.",
+                 "- No `&&`/`||`; chain with `;` or `if ($?) { ... }`."]
+    return lines + ["- Quote paths with spaces; use forward slashes or Join-Path.",
+                    "- Test-Path before using a path; don't guess locations.",
+                    "- Single-quote literal text; in double quotes, `$` and backtick are special."]
+
+
+def plan_codex_shell_notes(env):
+    shell = detect_shell(env.codex_home)
+    if shell not in ("pwsh", "powershell"):
+        if shell and shell != "other":
+            raise RxError(L("Codex가 PowerShell이 아닌 셸에서 명령을 실행하고 있어서 이 처방은 맞지 않아요.",
+                            "Codex doesn't run commands in PowerShell here, so these notes don't apply."))
+        if sys.platform != "win32":
+            raise RxError(L("Windows가 아니고 Codex 기록에서도 PowerShell을 찾지 못해서 이 처방은 맞지 않아요.",
+                            "This isn't Windows and the Codex logs don't show PowerShell, so these notes don't apply."))
+        shell = "pwsh" if shutil.which("pwsh") else "powershell"   # 기록이 없으면 이 PC에 있는 셸로 고른다
+    path = os.path.join(env.codex_home, "AGENTS.md")
+    old = None
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8", newline="") as f:   # 줄바꿈(CRLF)을 그대로 두려고 newline=""
+                old = f.read()
+    except UnicodeDecodeError:
+        raise RxError(L(f"{path} 파일이 UTF-8이 아니라서 건드리지 않았어요.", f"{path} isn't UTF-8, so it was left untouched."))
+    if old and SHELL_START in old:
+        raise RxError(_already())
+    nl = "\r\n" if old and "\r\n" in old else "\n"
+    block = nl.join([SHELL_START, *shell_notes(shell, sys.platform == "win32"), SHELL_END]) + nl
+    if old:
+        new = old + ("" if old.endswith("\n") else nl) + nl + block   # 기존 내용 뒤에 빈 줄 하나 두고 덧붙인다
+    else:
+        new = (old or "") + block
+    return [(path, old, new)]
+
+
 PRESCRIPTIONS = {   # title, summary는 (한국어, English)
     "claude-idle-guard": {
         "tool": "Claude Code", "plan": plan_idle_guard,
         "title": ("자리비움 경고 켜기", "Turn on the idle guard"),
         "summary": ("긴 대화를 캐시 만료 뒤에 이어가려 할 때 한 번 멈추고 예상 비용을 알려 줘요. "
-                    "같은 메시지를 10분 안에 다시 보내면 그대로 진행돼요. 새 대화부터 적용돼요.",
+                    "인수인계 메모도 남겨서, 같은 폴더에서 새 대화를 열고 \"이어서 해줘\"라고만 하면 몇천 토큰으로 이어받아요. "
+                    "그래도 이어가려면 같은 메시지를 10분 안에 다시 보내면 돼요. 새 대화부터 적용돼요.",
                     "When you resume a long conversation after its cache expired, it pauses once and shows the "
-                    "estimated cost. Send the same message again within 10 minutes to go ahead. Applies to new sessions."),
+                    "estimated cost. It also saves a handoff note, so a new conversation in the same folder picks up the "
+                    "work for a few thousand tokens when you say \"continue\". Send the same message again within "
+                    "10 minutes to go ahead anyway. Applies to new sessions."),
+    },
+    "claude-autocompact": {
+        "tool": "Claude Code", "plan": plan_autocompact,
+        "title": ("자동 압축을 40만 토큰에서", "Auto-compact at 400K tokens"),
+        "summary": ("100만 토큰 모델은 대화가 약 97만 토큰이 될 때까지 압축하지 않아서, 긴 대화는 질문 한 번에 수십만 토큰을 읽어요. "
+                    "40만 토큰에서 자동으로 압축하게 바꿔요. 압축하면 오래된 세부 내용은 요약으로 줄어들어요.",
+                    "1M-context models don't auto-compact until about 967K tokens, so every message in a long "
+                    "conversation reads hundreds of thousands of tokens. This compacts at 400K instead. Older details "
+                    "get summarized when it compacts."),
     },
     "claude-limit-recorder": {
         "tool": "Claude Code", "plan": plan_limit_recorder,
@@ -165,6 +238,17 @@ PRESCRIPTIONS = {   # title, summary는 (한국어, English)
         "summary": ("Codex의 기본 생각 수준(model_reasoning_effort)을 high로 바꿔요. 어려운 일에는 대화에서 ultra를 고르면 돼요.",
                     "Sets Codex model_reasoning_effort to high. Pick ultra in the conversation for hard problems."),
     },
+    "codex-shell-notes": {
+        "tool": "Codex", "plan": plan_codex_shell_notes,
+        "title": ("Codex에 셸 사용 요령 알려 주기", "Teach Codex your shell"),
+        "summary": ("Codex 전역 지시 파일(~/.codex/AGENTS.md)에 이 PC의 PowerShell에 맞는 짧은 요령(명령 잇는 법, 경로 따옴표 등)을 "
+                    "덧붙여서, 문법 오류나 없는 경로 때문에 명령이 실패하는 일을 줄여요. 모든 Codex 요청에 수십 토큰이 더해지지만 "
+                    "캐시되므로 부담은 작아요. undo하면 원래대로 돌아가요(파일을 새로 만들었다면 지워요).",
+                    "Appends a few short notes for your PowerShell (how to chain commands, quoting paths and so on) to Codex's "
+                    "global instructions (~/.codex/AGENTS.md), so fewer commands fail on syntax errors or missing paths. It adds "
+                    "a few dozen tokens to every Codex request, but they are cached, so it's cheap. undo puts things back "
+                    "(and deletes the file if it was created)."),
+    },
 }
 
 
@@ -173,7 +257,10 @@ def preview(changes):
     out = []
     for path, old, new in changes:
         if old is None:
-            out.append(L(f"+ 새 파일: {path}", f"+ new file: {path}"))
+            head = L(f"+ 새 파일: {path}", f"+ new file: {path}")
+            if len(new.splitlines()) <= 15:   # 짧은 파일은 내용도 보여 준다
+                head += "".join("\n+ " + line for line in new.splitlines())
+            out.append(head)
             continue
         diff = difflib.unified_diff(old.splitlines(), new.splitlines(), fromfile=path, tofile=path + L(" (처방 후)", " (after)"),
                                     lineterm="", n=2)
@@ -184,6 +271,10 @@ def preview(changes):
 def apply(rx_id, changes, env):
     """원본을 백업한 뒤 바꾼다. 백업 이름을 돌려준다."""
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    taken = os.listdir(env.backups) if os.path.isdir(env.backups) else []
+    while any(n.startswith(stamp) for n in taken):
+        time.sleep(0.2)   # 백업 이름(초 단위)이 적용 순서대로 정렬되도록 같은 초를 피한다
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     bdir = os.path.join(env.backups, f"{stamp}-{rx_id}")
     os.makedirs(bdir, exist_ok=True)
     manifest = {"rx": rx_id, "created": stamp, "files": []}
