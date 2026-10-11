@@ -54,7 +54,7 @@ python tokenrx.py backups         # list backups
 | Name | What it does |
 |---|---|
 | `claude-idle-guard` | `UserPromptSubmit` and `SessionStart` hooks. When you resume a long conversation after its cache expired, it pauses once and shows the estimated cost. It also writes a short handoff note. Open a new conversation in the same folder and say "continue": the new conversation is told where the note is, and picks up the work for a few thousand tokens instead of rebuilding the whole context. To go ahead anyway, send the same message again within 10 minutes. |
-| `claude-limit-recorder` | A status line that shows 5-hour and weekly limit usage plus time left on the prompt cache, and nudges you to `/compact` before a long conversation's cache runs out. It records limit snapshots so the report can forecast when you'll hit the limit. |
+| `claude-limit-recorder` | A status line that shows 5-hour and weekly limit usage plus time left on the prompt cache, and nudges you to `/compact` before a long conversation's cache runs out. It records limit snapshots so the report can forecast when you'll hit the limit. Works only in `claude` run from a terminal (the Claude desktop app doesn't run status lines). |
 | `claude-autocompact` | Sets `autoCompactWindow` to 400K tokens, so long conversations compact well before the 967K default. Older details get summarized when it compacts. |
 | `claude-subagent-sonnet` | Sets `CLAUDE_CODE_SUBAGENT_MODEL=sonnet`. |
 | `claude-default-opus` | Sets the default model to Opus. |

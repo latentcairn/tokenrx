@@ -62,6 +62,10 @@ def check(args):
         for d in xdiags:
             d["saving"] = savings.describe(sv.get(d.get("rx_id")), kind="codex")
 
+    active = {p["rx"] for p in periods if p["end"] is None}
+    for d in (cdiags or []) + xdiags:
+        d["applied"] = d.get("rx_id") in active   # 이미 켜 둔 처방은 다시 권하지 않는다
+
     if not ca and not (xa and xa.get("n")):
         print(L("분석할 기록이 없어요. Claude Code나 Codex를 쓴 적이 있는지, 기록 폴더 경로가 맞는지 확인하세요.",
                 "No logs to analyze. Check that you've used Claude Code or Codex and that the log folders are right."))

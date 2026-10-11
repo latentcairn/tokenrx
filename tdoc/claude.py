@@ -37,6 +37,8 @@ PRICES = {
 LONG_CONTEXT = 200_000      # 이보다 긴 대화는 매 턴 비용이 커진다
 MISS_MIN_TOKENS = 5_000     # 이보다 작은 캐시 재작성은 무시한다
 LIMITS_FILE = os.path.join("tokenrx", "limits.jsonl")   # 한도 기록기가 ~/.claude 아래에 쓰는 파일
+RECENT_STARTS = 20    # 대화 시작 고정비는 최근 대화 이만큼으로 본다(연결 도구가 늘면 커지므로)
+TERMINAL_MIN = 0.05   # 터미널 claude 사용 비중이 이보다 작으면 한도 기록기를 권하지 않는다(데스크톱 앱은 상태 표시줄을 실행하지 않는다)
 
 # 도구 실패(tool_result의 is_error)를 오류 메시지 앞부분으로 나눈다. 위에서부터 먼저 맞는 것을 쓴다.
 # rejected(사용자가 거절·중단, 권한 거부)는 실패가 아니라 따로 센다.
@@ -268,6 +270,9 @@ def analyze(reqs, limits=(), api_errors=()):
 
     # 2) 대화를 시작할 때마다 드는 고정비(기본 지시문, 도구 설명, MCP, 스킬 목록)
     starts = [th[0] for (s, a), th in threads.items() if a == "main"]
+    # 자동 실행(SDK) 대화는 도구 구성이 달라서 빼고, 사람이 여는 최근 대화만 본다
+    people = sorted((r for r in starts if not r["entry"].startswith("sdk")), key=lambda r: r["ts"])
+    recent_starts = (people or sorted(starts, key=lambda r: r["ts"]))[-RECENT_STARTS:]
 
     by_agent = collections.Counter()
     for r in reqs:
@@ -295,7 +300,7 @@ def analyze(reqs, limits=(), api_errors=()):
 
     return {
         "total": total, "n": len(reqs), "threads": threads, "misses": misses, "starts": starts,
-        "start_ctx": [ctx(r) for r in starts], "side_cost": sum(r["cost"] for r in reqs if r["sidechain"]),
+        "start_ctx": [ctx(r) for r in recent_starts], "side_cost": sum(r["cost"] for r in reqs if r["sidechain"]),
         "by_agent": by_agent, "long": [r for r in reqs if ctx(r) > LONG_CONTEXT],
         "out_cost": sum(r["out"] * (price_for(r["model"]) or (0, 0))[1] / 1e6 for r in reqs),
         "by": by, "first": min(r["ts"] for r in reqs), "last": max(r["ts"] for r in reqs),
@@ -378,15 +383,22 @@ def diagnoses(a):
         ratio = a["last7"] / a["weekly_avg"] if a["weekly_avg"] else 0
         compare = L(f"그 전 4주의 주 평균(${a['weekly_avg']:,.2f})의 {ratio:.1f}배예요. ",
                     f"That's {ratio:.1f}x your weekly average over the 4 weeks before (${a['weekly_avg']:,.2f}). ")
+        terminal = a["by"]["entry"].get("cli", 0) / a["total"] >= TERMINAL_MIN
         out.append({
             "title": L("사용 속도", "Usage pace"),
             "value": L(f"최근 7일 ${a['last7']:,.2f}", f"Last 7 days ${a['last7']:,.2f}"),
             "detail": (compare if a["weekly_avg"] else "")
                       + L("Claude Code 기록에는 한도 사용률이 남지 않아서 정확한 예보는 아직 못 해요.",
                           "Claude Code logs don't record limit usage, so an exact forecast isn't possible yet."),
-            "rx": L("한도 기록기를 켜면 5시간·주간 한도를 몇 % 썼는지 기록해서 언제 바닥날지 예보해 드려요.",
-                    "Turn on the limit recorder to log your 5-hour and weekly limit usage and get a forecast of when you'll run out."),
-            "rx_id": "claude-limit-recorder",
+            "rx": L("한도 기록기를 켜면 5시간·주간 한도를 몇 % 썼는지 기록해서 언제 바닥날지 예보해 드려요. "
+                    "터미널에서 실행한 claude에서만 기록돼요.",
+                    "Turn on the limit recorder to log your 5-hour and weekly limit usage and get a forecast of when you'll "
+                    "run out. It only records in claude run from a terminal.") if terminal else
+                  L("한도 기록기는 상태 표시줄로 기록하는데, Claude 데스크톱 앱은 상태 표시줄을 실행하지 않아요. "
+                    "주로 데스크톱 앱에서 쓰셔서 켜도 기록되지 않으니, 한도는 앱의 사용량 화면에서 확인하세요.",
+                    "The limit recorder logs through the status line, which the Claude desktop app doesn't run. You mostly "
+                    "use the desktop app, so it wouldn't record anything; check your limits on the app's usage screen."),
+            "rx_id": "claude-limit-recorder" if terminal else "",
             "level": 1 if ratio > 1.5 else 0,
         })
 
@@ -418,15 +430,17 @@ def diagnoses(a):
         out.append({
             "title": L("대화를 시작할 때마다 드는 고정비", "Fixed cost of starting a conversation"),
             "value": L(f"대화당 약 {med:,.0f} 토큰", f"~{med:,.0f} tokens per conversation"),
-            "detail": L(f"새 대화 {len(a['starts'])}개의 첫 요청이 평균적으로 이만큼을 읽었어요. "
-                        "기본 지시문, 연결된 MCP 도구 설명, 스킬 목록이 여기에 들어가요. "
-                        f"첫 요청들에 쓴 비용은 ${start_cost:,.2f} ({pct(start_cost, total):.1f}%)예요.",
-                        f"The first request of each of {len(a['starts'])} conversations read this much on average: "
-                        "the system prompt, MCP tool definitions and the skill list. "
-                        f"Those first requests cost ${start_cost:,.2f} ({pct(start_cost, total):.1f}%)."),
-            "rx": L("Claude Code에서 /mcp를 열어 안 쓰는 서버를 끄면 모든 대화의 고정비가 줄어요(설정은 지워지지 않아요).",
-                    "Open /mcp in Claude Code and turn off servers you don't use. Every conversation gets cheaper, "
-                    "and the server settings are kept."),
+            "detail": L(f"최근에 연 대화 {len(a['start_ctx'])}개의 첫 요청이 보통 이만큼을 읽었어요(자동 실행 대화는 뺐어요). "
+                        "기본 지시문, 연결된 MCP 도구 설명, 스킬 목록이 여기에 들어가요. 캐시가 깨질 때마다 이만큼도 다시 저장해요. "
+                        f"새 대화 {len(a['starts'])}개의 첫 요청에 쓴 비용은 ${start_cost:,.2f} ({pct(start_cost, total):.1f}%)예요.",
+                        f"The first request of your {len(a['start_ctx'])} most recent conversations typically read this much "
+                        "(automated runs excluded): the system prompt, MCP tool definitions and the skill list. Every cache "
+                        f"rebuild re-writes this too. The first requests of all {len(a['starts'])} conversations cost "
+                        f"${start_cost:,.2f} ({pct(start_cost, total):.1f}%)."),
+            "rx": L("안 쓰는 MCP 서버와 커넥터·플러그인을 끄면 모든 대화의 고정비가 줄어요. 터미널에서는 /mcp, "
+                    "데스크톱 앱에서는 커넥터·플러그인 설정에서 끌 수 있어요(설정은 지워지지 않아요).",
+                    "Turn off MCP servers, connectors and plugins you don't use, and every conversation gets cheaper. Use "
+                    "/mcp in the terminal, or the connector and plugin settings in the desktop app (settings are kept)."),
             "level": 2 if med > 60_000 else 1 if med > 30_000 else 0,
         })
 

@@ -234,9 +234,11 @@ PRESCRIPTIONS = {   # title, summary는 (한국어, English)
         "tool": "Claude Code", "plan": plan_limit_recorder,
         "title": ("한도 기록기 켜기", "Turn on the limit recorder"),
         "summary": ("상태 표시줄에 5시간·주간 한도 사용률과 캐시 남은 시간을 보여 주고, 한도 사용률을 PC에 기록해요. "
-                    "이 기록으로 언제 한도에 닿을지 예보해요. Claude 구독(Pro·Max)에서 동작하고, 상태 표시줄이 보이는 화면에서만 기록돼요.",
+                    "이 기록으로 언제 한도에 닿을지 예보해요. Claude 구독(Pro·Max)에서, 터미널에서 실행한 claude에서만 기록돼요"
+                    "(Claude 데스크톱 앱은 상태 표시줄을 실행하지 않아요).",
                     "Shows 5-hour and weekly limit usage and time left on the cache in the status line, and logs limit "
-                    "usage locally for forecasts. Needs a Claude Pro or Max plan and only records where the status line is shown."),
+                    "usage locally for forecasts. Needs a Claude Pro or Max plan and only records in claude run from a "
+                    "terminal (the Claude desktop app doesn't run status lines)."),
     },
     "claude-subagent-sonnet": {
         "tool": "Claude Code", "plan": plan_subagent_sonnet,

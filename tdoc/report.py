@@ -24,7 +24,7 @@ def recommended(diags):
     """주의·심각 진단에 연결된 처방 id 목록."""
     out = []
     for d in diags:
-        if d.get("rx_id") and d["level"] >= 1 and d["rx_id"] not in out:
+        if d.get("rx_id") and not d.get("applied") and d["level"] >= 1 and d["rx_id"] not in out:
             out.append(d["rx_id"])
     return out
 
@@ -39,6 +39,8 @@ def print_summary(ca, cdiags, ctitles, xa, xdiags, effects=()):
             print(f"{MARK[d['level']]} {d['title']}: {d['value']}\n     {d['detail']}")
             if d.get("saving"):
                 print(f"     → {d['saving']}")
+            if d.get("applied"):
+                print(L(f"     ✓ 적용됨: {d['rx_id']}", f"     ✓ Applied: {d['rx_id']}"))
         print(L("   캐시가 크게 깨진 순간", "   Biggest cache rebuilds"))
         for m in sorted(ca["misses"], key=lambda m: -m["waste"])[:3]:
             gap = L(f"공백 {m['gap'] / 60:,.0f}분", f"idle {m['gap'] / 60:,.0f} min")
@@ -53,6 +55,8 @@ def print_summary(ca, cdiags, ctitles, xa, xdiags, effects=()):
             print(f"{MARK[d['level']]} {d['title']}: {d['value']}\n     {d['detail']}")
             if d.get("saving"):
                 print(f"     → {d['saving']}")
+            if d.get("applied"):
+                print(L(f"     ✓ 적용됨: {d['rx_id']}", f"     ✓ Applied: {d['rx_id']}"))
     rec = recommended(cdiags + xdiags)
     if rec:
         print(L("\n추천 처방 (적용: python tokenrx.py apply <이름>)", "\nRecommended (apply: python tokenrx.py apply <name>)"))
@@ -72,7 +76,9 @@ def _cards(diags):
         rx = f"<p class='rx'><b>{L('처방', 'Fix')}</b> {html.escape(d['rx'])}</p>" if d.get("rx") else ""
         if d.get("saving"):
             rx += f"<p class='saving'>{html.escape(d['saving'])}</p>"
-        if d.get("rx_id"):
+        if d.get("rx_id") and d.get("applied"):
+            rx += f"<p class='cmd'>{L('적용됨', 'Applied')}: <code>{d['rx_id']}</code></p>"
+        elif d.get("rx_id"):
             rx += f"<p class='cmd'><code>python tokenrx.py apply {d['rx_id']}</code></p>"
         out.append(f"<section class='card {level_name[d['level']]}'><div class='tag'>{level_text[d['level']]}</div>"
                    f"<h3>{html.escape(d['title'])}</h3><p class='value'>{html.escape(d['value'])}</p>"

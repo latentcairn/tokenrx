@@ -67,6 +67,28 @@ class SavingsTest(unittest.TestCase):
                                                              "high": {"reqs": 3, "limit": 1}}}), {})
 
 
+class DiagnosisTest(unittest.TestCase):
+    def test_limit_recorder_only_for_terminal_users(self):
+        def pace(entry):
+            reqs = growing("s", 100, 5)
+            for r in reqs:
+                r["entry"] = entry
+            return next(d for d in claude.diagnoses(claude.analyze(reqs)) if d["title"] in ("사용 속도", "Usage pace"))
+        self.assertEqual(pace("cli")["rx_id"], "claude-limit-recorder")
+        self.assertEqual(pace("claude-desktop")["rx_id"], "", "데스크톱 앱은 상태 표시줄을 실행하지 않는다")
+
+    def test_start_cost_ignores_automated_runs(self):
+        reqs = []
+        for i in range(10):                                   # 맥락이 작은 자동 실행 대화가 많아도
+            r = req(f"sdk{i}", 200 + i, 0, 15_000)
+            r["entry"] = "sdk-py"
+            reqs.append(r)
+        reqs += [req("d1", 100, 0, 80_000), req("d2", 50, 0, 82_000)]   # 사람이 연 대화의 시작 크기를 본다
+        a = claude.analyze(reqs)
+        self.assertEqual(sorted(a["start_ctx"]), [80_010, 82_010])
+        self.assertEqual(len(a["starts"]), 12)
+
+
 class EffectTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="tokenrx-effect-")
