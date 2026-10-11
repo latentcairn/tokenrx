@@ -30,18 +30,18 @@ def line(record):
     return json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
 
 
-def assistant(seconds_ago, context, text=None, tools=(), ttl="1h", sidechain=False):
+def assistant(seconds_ago, context, text=None, tools=(), ttl="1h", sidechain=False, cwd="/work/app"):
     content = [{"type": "text", "text": text}] if text else []
     content += [{"type": "tool_use", "name": n, "input": i} for n, i in tools]
     write = {"ephemeral_1h_input_tokens": 1000} if ttl == "1h" else {"ephemeral_5m_input_tokens": 1000}
-    return {"type": "assistant", "isSidechain": sidechain, "timestamp": iso(seconds_ago), "cwd": "/work/app",
+    return {"type": "assistant", "isSidechain": sidechain, "timestamp": iso(seconds_ago), "cwd": cwd,
             "message": {"model": "claude-opus-5-5", "content": content, "usage": {
                 "input_tokens": 10, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": context - 1010,
                 "cache_creation": write, "output_tokens": 200}}}
 
 
-def user(text, seconds_ago, **extra):
-    return {"type": "user", "isSidechain": False, "timestamp": iso(seconds_ago), "cwd": "/work/app",
+def user(text, seconds_ago, cwd="/work/app", **extra):
+    return {"type": "user", "isSidechain": False, "timestamp": iso(seconds_ago), "cwd": cwd,
             "message": {"role": "user", "content": text}, **extra}
 
 
@@ -137,7 +137,11 @@ class IdleGuardTest(HookCase):
                          "/work/app/test_pay.py", "- [x] 리팩터링", "- [ ] 문서 갱신", "문서도 해줘", "/work/app"):
             self.assertIn(expected, note)
         self.assertNotIn("command-name", note)
-        self.assertNotIn("먼저 구조를 볼게요", note, "마지막 요청 전의 응답은 빠져야 한다")
+        self.assertIn(self.transcript, note, "원본 기록 위치를 알려야 한다")
+        self.assertIn("→ 먼저 구조를 볼게요", note, "앞선 요청에는 답의 첫 줄을 붙인다")
+        last = note.split("## 마지막 응답")[1]
+        self.assertNotIn("먼저 구조를 볼게요", last, "마지막 응답 칸에는 마지막 요청의 응답만 넣는다")
+        self.assertNotIn("⚠", note, "인수인계 문서가 없으면 표시하지 않는다")
 
     def test_new_session_hint_once_per_note(self):
         self.write(user("결제 모듈 리팩터링해줘", 7300), assistant(7200, 300_000, "끝냈어요."))
@@ -167,13 +171,86 @@ class IdleGuardTest(HookCase):
         self.assertIn("생략", note)
         self.assertLess(len(note), 20_000)
 
+    def note(self):
+        d = os.path.join(self.hooks, "handoff")
+        return read(os.path.join(d, [n for n in os.listdir(d) if n.endswith(".md")][0]))
+
+    def project(self):
+        proj = os.path.join(self.tmp, "proj")
+        os.makedirs(proj, exist_ok=True)
+        doc = os.path.join(proj, "HANDOFF.md")
+        with open(doc, "w", encoding="utf-8") as f:
+            f.write("# 인수인계\n")
+        return proj, doc
+
+    def test_handoff_flags_work_after_project_doc(self):
+        proj, doc = self.project()
+        code = os.path.join(proj, "pay.py")
+        self.write(user("결제 모듈 고쳐줘", 7600, cwd=proj),
+                   assistant(7550, 280_000, "고치고 문서에 적었어요.", tools=[("Edit", {"file_path": doc})], cwd=proj),
+                   user("테스트도 고쳐줘", 7400, cwd=proj),
+                   assistant(7350, 290_000, None, tools=[("Edit", {"file_path": code})], cwd=proj),
+                   assistant(7200, 300_000, "테스트도 고쳤어요.", cwd=proj))
+        t = time.time() - 7550
+        os.utime(doc, (t, t))
+        self.guard()
+        note = self.note()
+        self.assertIn(doc, note)
+        self.assertIn("요청 1개와 파일 1개", note)
+        self.assertIn("⚠ 테스트도 고쳐줘", note)
+        self.assertNotIn("⚠ 결제 모듈 고쳐줘", note, "문서를 고치기 전 요청은 문서에 담겼다")
+        self.assertIn(f"- ⚠ {code}", note)
+        self.assertNotIn(f"- ⚠ {doc}", note)
+
+    def test_handoff_says_when_project_doc_is_current(self):
+        proj, doc = self.project()
+        self.write(user("결제 모듈 고쳐줘", 7600, cwd=proj),
+                   assistant(7500, 280_000, None, tools=[("Edit", {"file_path": os.path.join(proj, "pay.py")})], cwd=proj),
+                   assistant(7450, 290_000, None, tools=[("Edit", {"file_path": doc})], cwd=proj),
+                   assistant(7440, 300_000, "끝냈고 문서도 고쳤어요.", cwd=proj))
+        t = time.time() - 7450
+        os.utime(doc, (t, t))
+        self.guard()
+        note = self.note()
+        self.assertIn("✅", note)
+        self.assertNotIn("⚠", note)
+
+    def test_hint_reaches_the_folder_the_conversation_started_in(self):
+        proj, _ = self.project()
+        sub = os.path.join(proj, "sub")
+        self.write(user("결제 모듈 고쳐줘", 7600, cwd=proj), assistant(7200, 300_000, "끝냈어요.", cwd=sub))
+        self.guard()
+
+        def start(cwd):
+            out = self.run_hook("idle_guard.py", {"hook_event_name": "SessionStart", "source": "startup", "cwd": cwd,
+                                                   "session_id": "new"})
+            return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.strip() else None
+
+        self.assertIn("handoff", start(proj))
+        self.assertIsNone(start(sub), "같은 메모를 다른 폴더에서 또 알리지 않는다")
+        self.assertIn(f"{proj}\n", self.note())
+
+    def test_long_transcript_keeps_start_folder_and_first_request(self):
+        proj, _ = self.project()
+        filler = assistant(9000, 200_000, "중간 작업 " * 400, cwd=os.path.join(proj, "sub"))
+        with open(self.transcript, "w", encoding="utf-8") as f:
+            f.write(line(user("목표: 결제 모듈을 asyncio로 옮기기", 9500, cwd=proj)))
+            f.write(line(filler) * (4_500_000 // len(line(filler)) + 1))
+            f.write(line(user("마무리해줘", 7300, cwd=os.path.join(proj, "sub"))))
+            f.write(line(assistant(7200, 300_000, "마무리했어요.", cwd=os.path.join(proj, "sub"))))
+        self.guard()
+        note = self.note()
+        self.assertIn("목표: 결제 모듈을 asyncio로 옮기기", note)
+        self.assertIn("마무리해줘", note)
+        self.assertIn(f"{proj}\n", note)
+
     def test_english(self):
         self.write(user("refactor payments", 7300), assistant(7200, 300_000, "Done."))
         reason = self.guard(lang="en")["reason"]
         self.assertIn("Hold on", reason)
         self.assertIn("handoff note", reason)
         note = read(os.path.join(self.hooks, "handoff", [n for n in os.listdir(os.path.join(self.hooks, "handoff")) if n.endswith(".md")][0]))
-        self.assertIn("Requests (oldest first)", note)
+        self.assertIn("Requests and answer gists (oldest first)", note)
 
 
 class LimitRecorderTest(HookCase):

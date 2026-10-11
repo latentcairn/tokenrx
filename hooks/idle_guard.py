@@ -23,6 +23,8 @@ LATEST = os.path.join(HANDOFF_DIR, "latest.json")   # 폴더별 가장 최근 �
 HANDOFF_FRESH = 3 * 3600   # 이보다 오래된 메모는 새 대화에 알리지 않는다
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 PROMPT_BUDGET = 8_000     # 메모에 넣는 요청 글자 수 한도(약 2~3천 토큰)
+HEAD_BYTES = 262_144      # 기록이 길어 끝부분만 읽을 때, 시작 폴더와 첫 요청은 앞부분에서 찾는다
+DOC_SLACK = 120           # 인수인계 문서를 고친 뒤 이 시간(초) 안의 작업은 문서에 담긴 것으로 본다
 LANG = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in ("ko", "en") else "ko"   # 처방이 설치할 때 넘겨 준다
 
 
@@ -90,74 +92,215 @@ def clip(text, limit, tail=False):
     return "… " + text[-limit:] if tail else text[:limit] + " …"
 
 
+def _ts(r):
+    try:
+        return dt.datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def _prompt_text(r):
+    """사람이 직접 보낸 요청이면 그 글을, 아니면(명령, 도구 결과, 압축 요약) 빈 글을 돌려준다."""
+    if r.get("type") != "user" or r.get("isMeta") or r.get("isCompactSummary"):
+        return ""
+    content = (r.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    text = content.strip() if isinstance(content, str) else ""
+    return "" if text.startswith(("<", "[Request interrupted")) else text
+
+
+def _parse(raw):
+    if b'"isSidechain":true' in raw or not (b'"type":"user"' in raw or b'"type":"assistant"' in raw):
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def _gist(text):
+    """답의 첫 줄. 답은 결론부터 쓰므로 이 한 줄이 그 턴의 요약 역할을 한다."""
+    for ln in text.splitlines():
+        ln = ln.strip().lstrip("#>*-| ").strip()
+        if ln:
+            return clip(ln, 200)
+    return ""
+
+
+def _when(ts, ref):
+    t = dt.datetime.fromtimestamp(ts)
+    return t.strftime("%H:%M") if t.date() == dt.datetime.fromtimestamp(ref).date() else t.strftime("%m/%d %H:%M")
+
+
+def _is_doc(name):
+    n = name.lower()
+    return n.startswith("handoff") and n.endswith((".md", ".txt"))
+
+
+def project_docs(folders, edited):
+    """프로젝트의 인수인계 문서(HANDOFF.md 같은 것). 작업 폴더에 있거나 이 대화에서 고친 것만 본다."""
+    found, seen = [], set()
+    cands = []
+    for d in folders:
+        try:
+            cands += [os.path.join(d, n) for n in sorted(os.listdir(d)) if _is_doc(n)]
+        except OSError:
+            pass
+    cands += [p for p in edited if _is_doc(os.path.basename(p))]
+    for p in cands:
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen and os.path.isfile(p):
+            seen.add(key)
+            found.append(p)
+    return found
+
+
 def write_handoff(transcript, session, pending):
-    """새 대화로 옮겨 갈 수 있게 최근 요청, 마지막 응답, 수정한 파일, 할 일 목록을 짧은 메모로 남긴다.
+    """새 대화로 옮겨 갈 수 있게 요청과 답의 요지, 마지막 응답, 수정한 파일, 할 일 목록을 짧은 메모로 남긴다.
 
     메모는 이 PC에만 저장한다. 새 대화는 대화 전체 대신 이 메모 몇천 토큰만 읽으면 된다.
+    프로젝트에 인수인계 문서가 있으면, 그 문서를 마지막으로 고친 뒤에 한 일을 ⚠로 표시한다.
     """
+    head = []
     with open(transcript, "rb") as f:
         f.seek(0, 2)
         size = f.tell()
+        cut = size > TAIL_BYTES
+        if cut:
+            f.seek(0)
+            head = f.read(HEAD_BYTES).splitlines()[:-1]   # 마지막 줄은 잘렸을 수 있다
         f.seek(max(0, size - TAIL_BYTES))
-        lines = f.read().splitlines()
-    prompts, replies, files, todos, cwd = [], [], [], [], ""
-    for raw in lines:
-        if b'"isSidechain":true' in raw or not (b'"type":"user"' in raw or b'"type":"assistant"' in raw):
+        lines = f.read().splitlines()[1 if cut else 0:]
+
+    start_cwd, first = "", None
+    for raw in head:
+        r = _parse(raw)
+        if not r:
             continue
-        try:
-            r = json.loads(raw)
-        except ValueError:
+        start_cwd = start_cwd or r.get("cwd") or ""
+        if first is None and _prompt_text(r):
+            first = (_ts(r), _prompt_text(r))
+        if start_cwd and first:
+            break
+
+    turns, files, todos, cwd, last_ts = [], {}, [], "", None
+    for raw in lines:
+        r = _parse(raw)
+        if not r:
             continue
         cwd = r.get("cwd") or cwd
+        start_cwd = start_cwd or cwd
+        ts = _ts(r)
+        text = _prompt_text(r)
+        if text:
+            turns.append({"ts": ts, "prompt": text, "replies": [], "work": None})
+            continue
         content = (r.get("message") or {}).get("content")
-        if r.get("type") == "user" and not r.get("isMeta") and not r.get("isCompactSummary"):
-            if isinstance(content, list):
-                content = " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
-            text = (content or "").strip() if isinstance(content, str) else ""
-            if text and not text.startswith(("<", "[Request interrupted")):
-                prompts.append(text)
-                replies = []   # 새 요청이 오면 마지막 응답을 새로 모은다
-        elif r.get("type") == "assistant" and isinstance(content, list):
-            for b in content:
-                if not isinstance(b, dict):
-                    continue
-                if b.get("type") == "text" and (b.get("text") or "").strip():
-                    replies.append(b["text"])
-                elif b.get("type") == "tool_use":
-                    inp = b.get("input") or {}
-                    if b.get("name") in EDIT_TOOLS and inp.get("file_path"):
-                        files = [p for p in files if p != inp["file_path"]] + [inp["file_path"]]
-                    elif b.get("name") == "TodoWrite" and isinstance(inp.get("todos"), list):
-                        todos = inp["todos"]
-    if not prompts and not replies:
+        if r.get("type") != "assistant" or not isinstance(content, list):
+            continue
+        if not turns:
+            turns.append({"ts": None, "prompt": "", "replies": [], "work": None})   # 앞부분이 잘려 요청 없이 시작
+        turn, last_ts = turns[-1], ts or last_ts
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and (b.get("text") or "").strip():
+                turn["replies"].append(b["text"])
+            elif b.get("type") == "tool_use":
+                turn["work"] = ts or turn["work"]
+                inp = b.get("input") or {}
+                if b.get("name") in EDIT_TOOLS and inp.get("file_path"):
+                    files.pop(inp["file_path"], None)
+                    files[inp["file_path"]] = ts or 0
+                elif b.get("name") == "TodoWrite" and isinstance(inp.get("todos"), list):
+                    todos = inp["todos"]
+    replies = turns[-1]["replies"] if turns else []
+    if not turns or not (any(t["prompt"] for t in turns) or replies):
         return None
+    ref = last_ts or time.time()
+
+    # 프로젝트 인수인계 문서를 마지막으로 고친 시각. 그 뒤에 들어온 요청과 그 뒤의 작업은 문서에 아직 없다.
+    docs = project_docs(dict.fromkeys(d for d in (start_cwd, cwd) if d), list(files))
+    doc_mtime = max((os.path.getmtime(p) for p in docs), default=None)
+
+    def stale_turn(t):
+        if doc_mtime is None:
+            return False
+        return (t["ts"] or 0) > doc_mtime or (t["work"] or 0) > doc_mtime + DOC_SLACK
+
+    def stale_file(p):
+        return doc_mtime is not None and files[p] > doc_mtime + DOC_SLACK and not _is_doc(os.path.basename(p))
 
     out = [f"# {L('이전 대화 인수인계', 'Handoff from a previous conversation')}", "",
            L("TokenRx가 캐시가 만료된 긴 대화를 새 대화로 옮기려고 이 PC 안에서 만든 메모예요.",
              "TokenRx wrote this note on this PC so a long conversation whose cache expired can continue in a new one."),
            ""]
-    if cwd:
-        out.append(f"- {L('작업 폴더', 'Working folder')}: {cwd}")
-    out += [f"- {L('이전 대화 ID', 'Previous conversation ID')}: {session}", ""]
-    if prompts:
+    if start_cwd:
+        out.append(f"- {L('작업 폴더', 'Working folder')}: {start_cwd}")
+    if cwd and cwd != start_cwd:
+        out.append(f"- {L('마지막 작업 폴더', 'Last working folder')}: {cwd}")
+    out += [f"- {L('이전 대화 ID', 'Previous conversation ID')}: {session}",
+            f"- {L('마지막 응답 시각', 'Last reply at')}: {_when(ref, time.time())}",
+            f"- {L('원본 대화 기록(이 메모에 없는 내용은 여기서 검색해 필요한 부분만 읽으세요)', 'Original transcript (search it for anything this note leaves out; read only what you need)')}: {transcript}",
+            ""]
+
+    if docs:
+        late = [t for t in turns if stale_turn(t)]
+        late_files = [p for p in files if stale_file(p)]
+        out += [f"## {L('프로젝트 인수인계 문서', 'Project handoff doc')}", ""]
+        out += [f"- {p} ({L('마지막 수정', 'last edited')} {_when(os.path.getmtime(p), ref)})" for p in docs]
+        out.append("")
+        if late or late_files:
+            out.append(L(
+                f"⚠ 문서를 마지막으로 고친 뒤에도 대화가 이어졌어요. 문서에 아직 없는 요청 {len(late)}개와 파일 {len(late_files)}개를 "
+                "아래에 ⚠로 표시했어요. 이어서 하기 전에 이 메모와 원본 기록으로 문서를 먼저 최신으로 고치세요.",
+                f"⚠ The conversation went on after the doc was last edited. {len(late)} request(s) and {len(late_files)} file(s) "
+                "not in the doc yet are marked ⚠ below. Before continuing, bring the doc up to date from this note and "
+                "the original transcript."))
+        else:
+            out.append(L("✅ 문서가 이 대화의 마지막 작업까지 담고 있어요. 이 문서부터 읽으세요.",
+                         "✅ The doc covers this conversation up to its last piece of work. Read it first."))
+        out.append("")
+    elif cut:
+        out += [L("기록이 길어서 중간 부분은 이 메모에 없어요. 필요하면 원본 기록에서 찾아보세요.",
+                  "The transcript is long, so its middle part is not in this note. Search the original if needed."), ""]
+
+    items = []   # (요청 줄, 답 요지 줄)
+    if cut and first and not (turns[0]["prompt"] and turns[0]["ts"] == first[0]):
+        items.append((f"[{_when(first[0], ref)}] {clip(' '.join(first[1].split()), 600)}" if first[0]
+                      else clip(" ".join(first[1].split()), 600), ""))
+    for t in turns:
+        if not t["prompt"]:
+            continue
+        when = f"[{_when(t['ts'], ref)}] " if t["ts"] else ""
+        mark = "⚠ " if stale_turn(t) else ""
+        gist = _gist(t["replies"][-1]) if t["replies"] and t is not turns[-1] else ""
+        items.append((f"{when}{mark}{clip(' '.join(t['prompt'].split()), 600)}", f"   → {gist}" if gist else ""))
+    if items:
         # 첫 요청(보통 일의 목표)은 늘 넣고, 나머지는 최근 것부터 분량 한도까지 넣는다
-        texts = [clip(" ".join(p.split()), 600) for p in prompts]
-        rest, used = [], len(texts[0])
-        for t in reversed(texts[1:]):
-            if used + len(t) > PROMPT_BUDGET:
+        size_of = lambda it: len(it[0]) + len(it[1])
+        rest, used = [], size_of(items[0])
+        for it in reversed(items[1:]):
+            if used + size_of(it) > PROMPT_BUDGET:
                 break
-            rest.insert(0, t)
-            used += len(t)
-        skipped = len(texts) - 1 - len(rest)
-        out += [f"## {L('요청 (오래된 것부터)', 'Requests (oldest first)')}", "", f"1. {texts[0]}"]
-        if skipped:
-            out.append(L(f"   … 중간 요청 {skipped}개 생략", f"   … {skipped} requests in between left out"))
-        out += [f"{i}. {t}" for i, t in enumerate(rest, 2 + skipped)] + [""]
+            rest.insert(0, it)
+            used += size_of(it)
+        skipped = len(items) - 1 - len(rest)
+        out += [f"## {L('요청과 답의 요지 (오래된 것부터)', 'Requests and answer gists (oldest first)')}", ""]
+        for i, (req, gist) in enumerate([items[0]] + rest, 1):
+            n = i if i == 1 else i + skipped
+            out.append(f"{n}. {req}")
+            if gist:
+                out.append(gist)
+            if i == 1 and skipped:
+                out.append(L(f"   … 중간 요청 {skipped}개 생략", f"   … {skipped} requests in between left out"))
+        out.append("")
     if replies:
         out += [f"## {L('마지막 응답', 'Last reply')}", "", clip("\n\n".join(replies), 6000, tail=True), ""]
     if files:
         out += [f"## {L('이 대화에서 수정한 파일', 'Files edited in this conversation')}", ""]
-        out += [f"- {p}" for p in files[-30:]] + [""]
+        out += [f"- {'⚠ ' if stale_file(p) else ''}{p}" for p in list(files)[-30:]] + [""]
     if todos:
         out += [f"## {L('할 일 목록', 'Todo list')}", ""]
         out += [f"- [{'x' if t.get('status') == 'completed' else ' '}] {clip(str(t.get('content', '')), 200)}"
@@ -175,9 +318,12 @@ def write_handoff(transcript, session, pending):
     path = os.path.join(HANDOFF_DIR, f"{time.strftime('%Y%m%d-%H%M%S')}-{session[:8] or 'session'}.md")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
-    if cwd:
+    # 새 대화는 보통 처음 연 폴더에서 열린다. 대화 중에 다른 폴더로 옮겼으면 두 폴더 모두에 알린다.
+    folders = [d for d in dict.fromkeys((start_cwd, cwd)) if d]
+    if folders:
         latest = load_json(LATEST)
-        latest[cwd] = {"path": path, "ts": time.time()}
+        for d in folders:
+            latest[d] = {"path": path, "ts": time.time()}
         with open(LATEST, "w", encoding="utf-8") as f:
             json.dump(latest, f)
     return path
@@ -191,11 +337,15 @@ def session_start(data):
     note = latest.pop(data.get("cwd") or "", None)
     if not note or time.time() - note.get("ts", 0) > HANDOFF_FRESH or not os.path.exists(note.get("path", "")):
         return
+    latest = {k: v for k, v in latest.items() if not (isinstance(v, dict) and v.get("path") == note["path"])}   # 같은 메모는 한 번만 알린다
     with open(LATEST, "w", encoding="utf-8") as f:
         json.dump(latest, f)
     hint = (f"[TokenRx] The previous conversation in this folder was paused because its prompt cache had expired. "
-            f"A handoff note was saved at {note['path']} (recent requests, last reply, files edited, todo list). "
-            "If the user wants to continue that work, read the note first instead of asking them to repeat the context.")
+            f"A handoff note was saved at {note['path']} (requests with a one-line gist of each answer, the last reply, "
+            "files edited, the todo list, and the original transcript path). "
+            "If the user wants to continue that work, read the note first instead of asking them to repeat the context. "
+            "If the note says the project's own handoff doc is behind (items marked ⚠), bring that doc up to date from "
+            "the note, searching the original transcript for details, before continuing.")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": hint}}))
 
 
