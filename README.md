@@ -80,6 +80,27 @@ python tests/e2e_claude.py <path to claude executable>   # idle guard inside rea
 
 The end-to-end test runs Claude Code in print mode against a throwaway session and settings file, checks that the guard blocks without calling the model, and cleans up after itself.
 
+## Validation
+
+`eval/` is an A/B harness that checks whether two prescriptions save tokens without making Claude Code worse at the task. There are no published results yet.
+
+| Experiment | Arms | What it measures |
+|---|---|---|
+| `autocompact` | Auto-compact at 1M (control) or 400K (treatment) | The first message sets six exact requirements. The model then reviews about 560K tokens of code and docs, implements a feature and runs the tests. Hidden checks score each requirement. |
+| `handoff` | Keep going in the same conversation, or start a new one from the idle guard's handoff note | A conversation of about 230K tokens makes decisions along the way, and the follow-up task depends on them. Both arms start from the same state. |
+
+```
+python eval/run.py --exp autocompact --model claude-haiku-5-5 --trials 10 --estimate   # expected tokens and cost; runs nothing
+python eval/run.py --exp handoff --trials 2 --out eval-out/dry --dry-run               # the whole pipeline with a fake claude
+python eval/run.py --claude <path to claude> --preflight                               # two tiny real calls to check the setup
+python eval/run.py --claude <path to claude> --exp autocompact --model claude-haiku-5-5 --trials 10 --out eval-out/ac-haiku
+```
+
+- **It uses your limit.** Real runs go through your subscription. Run `--estimate` first, and use a full model id such as `claude-haiku-5-5`. `--budget` stops starting new trials once spend reaches a limit. Running again with the same `--out` adds more trials.
+- **Each trial is isolated.** It runs in a new temporary folder with `--setting-sources project`, its own `--settings` and no MCP servers. The model only gets Read, Glob, Grep, Edit, Write and Python commands. Afterwards the transcripts move to `<out>/transcripts/`, `claude purge` clears what Claude Code kept about the folder, and the folder is deleted. Your own usage report is unaffected.
+- **How it scores.** Hidden checks are copied in only after the conversation ends. The visible tests and a final recall quiz are scored too. The summary shows the pass rate (Fisher exact and paired McNemar tests), mean tokens by type, mean cost with a bootstrap 95% interval for the difference, compactions per trial and the size of the first request. For `handoff`, it also shows what continuing would have cost had the cache expired.
+- Results are written to `<out>/trials.jsonl` and `<out>/summary.json`.
+
 ## Caveats
 
 - **The Claude Code log format can change.** It is internal and undocumented, so it may change between versions. Unknown lines are skipped.

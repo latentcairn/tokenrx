@@ -73,6 +73,27 @@ python tests/e2e_claude.py <claude 실행 파일 경로>      # 실제 Claude Co
 
 종단 테스트는 임시 대화와 임시 설정 파일로 Claude Code를 실행해서, 경고가 모델을 부르지 않고 막는지 확인하고 흔적을 지워요.
 
+## 검증
+
+`eval/`은 처방이 Claude Code의 작업 품질을 떨어뜨리지 않고 토큰을 아끼는지 비교하는 A/B 평가 도구예요. 아직 공개한 결과는 없어요.
+
+| 실험 | 비교 | 재는 것 |
+|---|---|---|
+| `autocompact` | 자동 압축 기준 1M(control)과 400K(treatment) | 첫 메시지로 정확한 요구 사항 6개를 줘요. 그다음 약 56만 토큰 분량의 코드와 문서를 리뷰하고, 기능을 구현하고, 테스트를 돌려요. 요구 사항마다 숨은 채점으로 확인해요. |
+| `handoff` | 같은 대화를 이어가기와, 자리비움 경고의 인수인계 메모로 새 대화 열기 | 약 23만 토큰짜리 대화에서 중간중간 결정을 내리고, 후속 작업이 그 결정에 따라야 해요. 두 방식은 같은 상태에서 출발해요. |
+
+```
+python eval/run.py --exp autocompact --model claude-haiku-5-5 --trials 10 --estimate   # 예상 토큰과 비용(아무것도 실행하지 않음)
+python eval/run.py --exp handoff --trials 2 --out eval-out/dry --dry-run               # 가짜 claude로 전체 흐름 확인
+python eval/run.py --claude <claude 실행 파일 경로> --preflight                          # 아주 짧은 실제 요청 두 개로 설정 확인
+python eval/run.py --claude <claude 실행 파일 경로> --exp autocompact --model claude-haiku-5-5 --trials 10 --out eval-out/ac-haiku
+```
+
+- **한도를 써요.** 실제 실행은 구독 한도를 써요. 먼저 `--estimate`로 비용을 보고, 모델은 `claude-haiku-5-5`처럼 전체 이름으로 적으세요. `--budget`을 주면 쓴 금액이 그만큼에 닿았을 때 새 시행을 시작하지 않아요. 같은 `--out`으로 다시 실행하면 시행이 더해져요.
+- **시행마다 따로 돌아요.** 새 임시 폴더에서 `--setting-sources project`, 시행별 `--settings`, MCP 서버 없이 실행해요. 모델은 Read, Glob, Grep, Edit, Write와 파이썬 명령만 쓸 수 있어요. 끝나면 대화 기록을 `<out>/transcripts/`로 옮기고, `claude purge`로 Claude Code가 그 폴더에 대해 남긴 것을 지운 뒤, 폴더를 지워요. 내 사용 기록 진단에는 섞이지 않아요.
+- **채점 방법.** 숨은 채점은 대화가 끝난 뒤에만 넣어요. 보이는 테스트와 마지막 기억 퀴즈도 채점해요. 결과에는 합격률(Fisher 정확 검정, 짝 비교 McNemar 검정), 종류별 평균 토큰, 평균 비용과 차이의 부트스트랩 95% 구간, 시행당 압축 횟수, 첫 요청의 크기가 나와요. `handoff`는 캐시가 만료됐다면 이어가기에 얼마가 더 들었을지도 보여 줘요.
+- 결과는 `<out>/trials.jsonl`과 `<out>/summary.json`에 써요.
+
 ## 알아 둘 점
 
 - **기록 형식이 바뀔 수 있어요.** Claude Code 기록 형식은 공식 문서가 없고 버전마다 바뀔 수 있어요. 모르는 줄은 건너뛰어요.

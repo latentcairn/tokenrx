@@ -96,6 +96,46 @@ class EffectTest(unittest.TestCase):
         self.assertTrue(e[0]["enough"])
         self.assertIn("→", effect.describe(e[0]))
 
+    def test_quality_signals(self):
+        day = 24 * 60
+        def with_tools(r, calls, fails, rejected=0):
+            r.update(calls=calls, fails=["exit_code"] * fails, rejected=rejected)
+            return r
+        before = [with_tools(req(f"b{i}", 10 * day + i, 0, 20_000, model="claude-fable-5-1"), 5, 0) for i in range(60)]
+        after = [with_tools(req(f"a{i}", 3 * day + i, 0, 20_000), 5, 1) for i in range(60)]
+        self.backup("claude-default-opus", 5)
+        e = effect.claude_effects(claude.analyze(before + after), effect.applied(self.tmp))[0]
+        self.assertEqual(e["q_before"]["fail"], 0)
+        self.assertEqual(e["q_after"]["fail"], 20)
+        self.assertIn("20.0%", effect.describe(e))
+        self.assertTrue("나빠졌어요" in effect.describe(e) or "worse" in effect.describe(e))
+
+    def test_reapply_counts_as_one_period(self):
+        self.backup("claude-idle-guard", 6)
+        self.backup("claude-idle-guard", 2)      # 스크립트 업데이트
+        periods = effect.applied(self.tmp)
+        self.assertEqual(len(periods), 1)
+        self.assertLess(periods[0]["start"], dt.datetime.now().astimezone() - dt.timedelta(days=5))
+
+    def test_codex_effects(self):
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        def turn(days_ago, cmd, shell_fail, st="ok"):
+            return {"ts": now - days_ago * 86400, "st": st, "cmd": cmd, "fail": shell_fail,
+                    "cats": {"shell_syntax": shell_fail}}
+        turns = {f"b{i}": turn(10, 10, 2) for i in range(40)}
+        turns.update({f"a{i}": turn(2, 10, 0, "aborted" if i < 4 else "ok") for i in range(40)})
+        reqs = [{"ts": now - 10 * 86400, "effort": "ultra"}] * 10 + [{"ts": now - 2 * 86400, "effort": "high"}] * 10
+        self.backup("codex-shell-notes", 5)
+        self.backup("codex-effort-high", 5)
+        e = {x["rx"]: x for x in effect.codex_effects(reqs, turns, effect.applied(self.tmp))}
+        self.assertEqual(round(e["codex-shell-notes"]["before"]), 20)
+        self.assertEqual(e["codex-shell-notes"]["after"], 0)
+        self.assertEqual(e["codex-effort-high"]["before"], 100)
+        self.assertEqual(e["codex-effort-high"]["after"], 0)
+        self.assertEqual(round(e["codex-shell-notes"]["q_after"]["rejected"]), 10)
+        self.assertTrue(e["codex-shell-notes"]["enough"])
+        self.assertIn("→", effect.describe(e["codex-shell-notes"]))
+
     def test_too_early_and_undone(self):
         reqs = [req(f"x{i}", i, 0, 20_000) for i in range(80)]
         self.backup("claude-autocompact", 1)

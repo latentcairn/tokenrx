@@ -38,7 +38,8 @@ def check(args):
             ca = claude.analyze(reqs, claude.load_limits(args.claude_home), api_errors)
             cdiags = claude.diagnoses(ca)
 
-    xa, xdiags = None, []
+    xa, xdiags, xeffects = None, [], []
+    periods = effect.applied(env_of(args).backups)
     if not args.no_codex and os.path.isdir(os.path.join(args.codex_home, "sessions")):
         key = hashlib.sha1(os.path.abspath(args.codex_home).encode("utf-8")).hexdigest()[:10]
         cache = os.path.join(HERE, "cache", f"codex-{key}.json")
@@ -48,13 +49,14 @@ def check(args):
         reqs, limits, threads, titles, turns = codex.load(args.codex_home, cache)
         xa = codex.analyze(reqs, limits, threads, titles, days=args.days, turns=turns)
         xdiags = codex.diagnoses(xa)
+        xeffects = effect.codex_effects(reqs, turns, periods)
 
-    effects = []
+    effects = list(xeffects)
     if ca:
         sv = savings.claude_savings(ca)
         for d in cdiags:
             d["saving"] = savings.describe(sv.get(d.get("rx_id")))
-        effects = effect.claude_effects(ca, effect.applied(env_of(args).backups))
+        effects = effect.claude_effects(ca, periods) + effects
     if xa and xa.get("n"):
         sv = savings.codex_savings(xa)
         for d in xdiags:

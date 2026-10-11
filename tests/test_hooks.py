@@ -154,13 +154,26 @@ class IdleGuardTest(HookCase):
         self.assertIn(os.path.join(self.hooks, "handoff"), hint)
         self.assertIsNone(start(), "한 번만 알린다")
 
+    def test_handoff_keeps_first_request_when_long(self):
+        records = [user("목표: 결제 모듈을 asyncio로 옮기기. 상수 RETRY_LIMIT=7 유지", 9000)]
+        records += [user(f"작업 {i}: " + "세부 내용 " * 60, 8900 - i) for i in range(40)]
+        records += [assistant(7200, 300_000, "끝냈어요.")]
+        self.write(*records)
+        self.guard()
+        note = read(os.path.join(self.hooks, "handoff",
+                                 [n for n in os.listdir(os.path.join(self.hooks, "handoff")) if n.endswith(".md")][0]))
+        self.assertIn("RETRY_LIMIT=7", note)
+        self.assertIn("작업 39", note)
+        self.assertIn("생략", note)
+        self.assertLess(len(note), 20_000)
+
     def test_english(self):
         self.write(user("refactor payments", 7300), assistant(7200, 300_000, "Done."))
         reason = self.guard(lang="en")["reason"]
         self.assertIn("Hold on", reason)
         self.assertIn("handoff note", reason)
         note = read(os.path.join(self.hooks, "handoff", [n for n in os.listdir(os.path.join(self.hooks, "handoff")) if n.endswith(".md")][0]))
-        self.assertIn("Recent requests", note)
+        self.assertIn("Requests (oldest first)", note)
 
 
 class LimitRecorderTest(HookCase):

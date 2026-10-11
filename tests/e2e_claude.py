@@ -22,9 +22,20 @@ import uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+MODEL = "claude-haiku-5-5"   # 훅이 통과시킨 요청만 실제로 나가므로 가장 싼 모델을 쓴다
+
+
 def claude(exe, cwd, settings, *args):
-    p = subprocess.run([exe, "-p", *args, "--tools", "", "--output-format", "json", "--settings", settings],
-                       cwd=cwd, capture_output=True, stdin=subprocess.DEVNULL, timeout=180)
+    # 사용자 설정(실제로 켜 둔 처방 포함)과 MCP 서버는 읽지 않는다. MCP 도구 설명만으로 요청마다 10만 토큰이 넘게 붙는다.
+    mcp = os.path.join(os.path.dirname(settings), "mcp.json")
+    with open(mcp, "w", encoding="utf-8") as f:
+        json.dump({"mcpServers": {}}, f)
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("CLAUDE") or k.upper() == "CLAUDE_CONFIG_DIR"}
+    env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    p = subprocess.run([exe, "-p", *args, "--model", MODEL, "--tools", "", "--output-format", "json",
+                        "--setting-sources", "project", "--settings", settings,
+                        "--strict-mcp-config", "--mcp-config", mcp],
+                       cwd=cwd, env=env, capture_output=True, stdin=subprocess.DEVNULL, timeout=180)
     return json.loads(p.stdout.decode("utf-8"))
 
 
@@ -42,7 +53,7 @@ def main(exe):
         settings = os.path.join(home, "settings.json")
 
         sid = str(uuid.uuid4())
-        claude(exe, work, settings, "Reply with exactly: OK", "--model", "haiku", "--session-id", sid)
+        claude(exe, work, settings, "Reply with exactly: OK", "--session-id", sid)
         transcript = os.path.join(project, sid + ".jsonl")
         with open(transcript, encoding="utf-8") as f:
             rows = [json.loads(x) for x in f]
@@ -57,13 +68,13 @@ def main(exe):
         with open(transcript, "a", encoding="utf-8") as f:
             f.write(json.dumps(fake, separators=(",", ":")) + "\n")   # Claude Code처럼 공백 없이 쓴다
 
-        first = claude(exe, work, settings, "continue", "--resume", sid, "--model", "haiku")
-        second = claude(exe, work, settings, "continue", "--resume", sid, "--model", "haiku")
+        first = claude(exe, work, settings, "continue", "--resume", sid)
+        second = claude(exe, work, settings, "continue", "--resume", sid)
         handoffs = [n for n in os.listdir(os.path.join(home, "tokenrx", "handoff")) if n.endswith(".md")]
 
         # 같은 폴더에서 새 대화를 열면 SessionStart 훅이 메모를 한 번 알려 준다
         new_sid = str(uuid.uuid4())
-        claude(exe, work, settings, "continue", "--model", "haiku", "--session-id", new_sid)
+        claude(exe, work, settings, "continue", "--session-id", new_sid)
         with open(os.path.join(project, new_sid + ".jsonl"), encoding="utf-8") as f:
             new_log = f.read()
         with open(os.path.join(home, "tokenrx", "handoff", "latest.json"), encoding="utf-8") as f:

@@ -22,6 +22,7 @@ HANDOFF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handoff"
 LATEST = os.path.join(HANDOFF_DIR, "latest.json")   # 폴더별 가장 최근 메모
 HANDOFF_FRESH = 3 * 3600   # 이보다 오래된 메모는 새 대화에 알리지 않는다
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+PROMPT_BUDGET = 8_000     # 메모에 넣는 요청 글자 수 한도(약 2~3천 토큰)
 LANG = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in ("ko", "en") else "ko"   # 처방이 설치할 때 넘겨 준다
 
 
@@ -139,8 +140,19 @@ def write_handoff(transcript, session, pending):
         out.append(f"- {L('작업 폴더', 'Working folder')}: {cwd}")
     out += [f"- {L('이전 대화 ID', 'Previous conversation ID')}: {session}", ""]
     if prompts:
-        out += [f"## {L('최근 요청 (오래된 것부터)', 'Recent requests (oldest first)')}", ""]
-        out += [f"{i}. {clip(' '.join(p.split()), 800)}" for i, p in enumerate(prompts[-6:], 1)] + [""]
+        # 첫 요청(보통 일의 목표)은 늘 넣고, 나머지는 최근 것부터 분량 한도까지 넣는다
+        texts = [clip(" ".join(p.split()), 600) for p in prompts]
+        rest, used = [], len(texts[0])
+        for t in reversed(texts[1:]):
+            if used + len(t) > PROMPT_BUDGET:
+                break
+            rest.insert(0, t)
+            used += len(t)
+        skipped = len(texts) - 1 - len(rest)
+        out += [f"## {L('요청 (오래된 것부터)', 'Requests (oldest first)')}", "", f"1. {texts[0]}"]
+        if skipped:
+            out.append(L(f"   … 중간 요청 {skipped}개 생략", f"   … {skipped} requests in between left out"))
+        out += [f"{i}. {t}" for i, t in enumerate(rest, 2 + skipped)] + [""]
     if replies:
         out += [f"## {L('마지막 응답', 'Last reply')}", "", clip("\n\n".join(replies), 6000, tail=True), ""]
     if files:

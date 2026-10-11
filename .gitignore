@@ -6,3 +6,4 @@ __pycache__/
 hooks/*.json
 hooks/*.jsonl
 sample-data/
+eval-out/
