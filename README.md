@@ -64,6 +64,14 @@ python tokenrx.py backups         # list backups
 - **Files touched:** `~/.claude/settings.json`, `~/.claude/tokenrx/`, `~/.codex/config.toml` and `~/.codex/AGENTS.md`.
 - **Undo:** originals are saved in `backups/`, and `undo` restores them byte for byte.
 
+## Tidy desktop chats
+
+```
+python tokenrx.py sessions        # Claude desktop chats: which to archive or rename, and why (changes nothing)
+```
+
+A big chat that has gone cold costs a full cache re-write if you reopen it by mistake. The list flags chats the idle guard handed off, big chats a newer chat in the same folder took over, short test chats, and chats unused for two weeks, plus titles that don't say what the chat is. With the TokenRx mod installed, say "tidy my chats" in the desktop app (`/tokenrx:tidy`): Claude shows the same list, then renames and archives only the chats you pick. Archived chats can be restored anytime; nothing is deleted.
+
 ## Try it with synthetic data
 
 ```

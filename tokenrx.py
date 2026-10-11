@@ -12,10 +12,12 @@ PC 안에서만 동작하고 인터넷에 아무것도 보내지 않는다. 진�
     python tokenrx.py apply <name>          처방 적용(백업 → 미리 보기 → 동의 → 적용) / apply a prescription
     python tokenrx.py undo [backup]         처방 되돌리기 / revert a prescription
     python tokenrx.py backups               처방 백업 목록 / list backups
+    python tokenrx.py sessions              데스크톱 앱 대화 목록과 정리 추천 / desktop chats and which to archive
 """
 import argparse
 import datetime as dt
 import hashlib
+import importlib.util
 import os
 import sys
 
@@ -138,6 +140,16 @@ def show_backups(args):
     return 0
 
 
+def show_sessions(args):
+    """대화 정리 스킬과 같은 스크립트로 목록만 보여 준다. 보관과 이름 바꾸기는 앱 안의 Claude가 한다."""
+    path = os.path.join(HERE, "mod", "skills", "tidy", "sessions.py")
+    spec = importlib.util.spec_from_file_location("tokenrx_sessions", path)
+    sessions = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sessions)
+    argv = ["--lang", i18n.LANG, "--claude-home", args.claude_home] + ["--json"] * args.json + ["--all"] * args.all
+    return sessions.main(argv)
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description="TokenRx: find and fix token and usage-limit waste in Claude Code and Codex")
@@ -155,9 +167,13 @@ def main():
     p_undo = sub.add_parser("undo", help="revert a prescription")
     p_undo.add_argument("name", nargs="?")
     sub.add_parser("backups", help="list backups")
+    p_sess = sub.add_parser("sessions", help="list desktop-app chats and which to archive or rename")
+    p_sess.add_argument("--json", action="store_true", help="machine-readable output")
+    p_sess.add_argument("--all", action="store_true", help="include archived chats")
     args = ap.parse_args()
     i18n.set_lang(args.lang)
-    handlers = {None: check, "rx": list_rx, "apply": apply_rx, "undo": undo_rx, "backups": show_backups}
+    handlers = {None: check, "rx": list_rx, "apply": apply_rx, "undo": undo_rx, "backups": show_backups,
+                "sessions": show_sessions}
     return handlers[args.cmd](args)
 
 

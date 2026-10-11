@@ -1,0 +1,32 @@
+{
+  "name": "tokenrx",
+  "version": "0.3.1",
+  "description": "TokenRx: shows your usage limits, this chat's size and the minutes left on its prompt cache above the prompt, warns (or compacts) before the cache cools, and tidies the desktop chat list (/tokenrx:tidy).",
+  "author": {
+    "name": "latentcairn"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "lang": {
+      "type": "string",
+      "title": "Language",
+      "description": "auto follows TOKENRX_LANG, then the system language",
+      "options": [
+        "auto",
+        "ko",
+        "en"
+      ],
+      "default": "auto"
+    },
+    "autoCompact": {
+      "type": "string",
+      "title": "Auto compact",
+      "description": "on: compact a chat of 100K+ tokens automatically 5 minutes before its cache cools; off: only warn",
+      "options": [
+        "off",
+        "on"
+      ],
+      "default": "off"
+    }
+  }
+}

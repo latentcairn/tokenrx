@@ -1,0 +1,13 @@
+{
+  "name": "latentcairn",
+  "description": "TokenRx: find and fix token and usage-limit waste in Claude Code",
+  "owner": {
+    "name": "latentcairn"
+  },
+  "plugins": [
+    {
+      "name": "tokenrx",
+      "source": "./mod"
+    }
+  ]
+}
