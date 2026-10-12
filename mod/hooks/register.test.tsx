@@ -15,7 +15,7 @@ const LIMITS = [
   { kind: 'seven_day', percentUsed: 13, resetsAt: '2026-10-12T19:00:00Z' },
 ]
 
-function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t' }) {
+function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t' }, settings: Record<string, unknown> = {}) {
   const clock = mock.clock(on, { now: T0 })
   mock.store(on)
   mock.env(on, env)
@@ -33,6 +33,7 @@ function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERP
   on('session.usage', () => ({
     value: { startedAt: T0, context: { tokens: 255_186, window: 1_000_000, percent: 26 }, rateLimits: LIMITS },
   }))
+  on('settings.read', () => ({ value: settings }))
   on('fs.read', () => ({ deny: 'missing' }))
   on('fs.write', ($, e) => {
     writes.push({ path: e.path, text: e.text })
@@ -153,5 +154,36 @@ test('with autoCompact on, falls back to the warning when compaction is refused'
   await startAndReply($)
   await clock.advance(56 * MIN)
   expect(toasts.length).toBe(1)
+  expect(toasts[0]).toContain('/compact')
+})
+
+// 데스크톱 앱은 설치본을 'inline'으로 넘겨서 엔진이 pluginConfigs["tokenrx@latentcairn"]을 읽지 않는다(기본값 off로 시작)
+const INSTALLED_ON = { pluginConfigs: { 'tokenrx@latentcairn': { options: { lang: 'ko', autoCompact: 'on' } } } }
+const ENV = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\profiles\t' }
+
+test('picks up autoCompact saved at install when the app hands the mod over without options', async ($, on) => {
+  const { clock, toasts } = world(on, ENV, INSTALLED_ON)
+  const compacts: (string | undefined)[] = []
+  on('session.compact', ($, e) => {
+    compacts.push(e.instructions)
+    return { messages: [{ role: 'user' as const, text: '요약', toolUses: [] }], tokensBefore: 255_186, tokensAfter: 20_000 }
+  })
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  expect(compacts.length).toBe(1)
+  expect(toasts[0]).toContain('자동으로 압축')
+})
+
+test('a value set for the inline copy itself wins over the one saved at install', async ($, on) => {
+  const settings = { pluginConfigs: { ...INSTALLED_ON.pluginConfigs, tokenrx: { options: { autoCompact: 'off' } } } }
+  const { clock, toasts } = world(on, ENV, settings)
+  const compacts: unknown[] = []
+  on('session.compact', ($, e) => {
+    compacts.push(e)
+    return { messages: [], tokensBefore: 1, tokensAfter: 1 }
+  })
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  expect(compacts.length).toBe(0)
   expect(toasts[0]).toContain('/compact')
 })

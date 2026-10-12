@@ -180,6 +180,24 @@ const COMPACT_INSTRUCTIONS =
   'Automatic compaction while the user is away, just before the prompt cache expires. Keep the current task, ' +
   'decisions made, open questions, next steps and the paths of files edited, so the conversation can go on as before.'
 
+const optionsOf = (v: unknown) =>
+  v && typeof v === 'object' && 'options' in v && v.options && typeof v.options === 'object'
+    ? (v.options as Record<string, unknown>)
+    : undefined
+
+/**
+ * 설치할 때 저장된 설정(pluginConfigs["tokenrx@<마켓>"]). 데스크톱 앱은 설치본을 'inline'으로 넘기고,
+ * 그러면 엔진은 pluginConfigs["tokenrx"]와 ["tokenrx@inline"]만 읽어서 설치 때 고른 값을 놓친다.
+ * 그 두 키에 값이 있으면 엔진이 이미 반영했으니 undefined.
+ */
+export function savedOptions(configs: unknown, name: string): Record<string, unknown> | undefined {
+  if (!configs || typeof configs !== 'object') return undefined
+  const entries = Object.entries(configs as Record<string, unknown>)
+  if (entries.some(([k, v]) => (k === name || k === `${name}@inline`) && optionsOf(v))) return undefined
+  const hit = entries.find(([k, v]) => k.startsWith(`${name}@`) && optionsOf(v))
+  return hit ? optionsOf(hit[1]) : undefined
+}
+
 /** 캐시가 식기 전에 압축한다. 압축했으면 true, 못 했으면(진행 중인 턴, 다른 플러그인의 거부, 오류) false. */
 async function compactNow($: EngineInterface) {
   try {
@@ -219,8 +237,16 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    let opts: Readonly<Record<string, unknown>> = options
     try {
-      lang = pickLang(options?.lang, await $.env.get('TOKENRX_LANG'))
+      const saved = savedOptions((await $.settings.read({ source: 'user' })).pluginConfigs, $.plugin.name)
+      if (saved) opts = { ...options, ...saved }
+    } catch {
+      // 설정을 못 읽으면 엔진이 준 값대로 돈다
+    }
+    autoCompact = opts?.autoCompact === 'on'
+    try {
+      lang = pickLang(opts?.lang, await $.env.get('TOKENRX_LANG'))
       const id = await $.session.id()
       const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>
       const last = seen[id]
