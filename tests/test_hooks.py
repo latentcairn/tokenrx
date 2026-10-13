@@ -156,6 +156,7 @@ class IdleGuardTest(HookCase):
         self.assertIsNone(start(cwd="/other"), "다른 폴더에는 알리지 않는다")
         hint = start()
         self.assertIn(os.path.join(self.hooks, "handoff"), hint)
+        self.assertIn("set_session_title", hint, "'이어서 해줘'로 지어진 제목을 하던 일 이름으로 바꾸게 한다")
         self.assertIsNone(start(), "한 번만 알린다")
 
     def test_handoff_keeps_first_request_when_long(self):

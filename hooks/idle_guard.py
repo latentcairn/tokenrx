@@ -345,7 +345,10 @@ def session_start(data):
             "files edited, the todo list, and the original transcript path). "
             "If the user wants to continue that work, read the note first instead of asking them to repeat the context. "
             "If the note says the project's own handoff doc is behind (items marked ⚠), bring that doc up to date from "
-            "the note, searching the original transcript for details, before continuing.")
+            "the note, searching the original transcript for details, before continuing. "
+            "This chat's title was made from a bare 'continue' prompt, so once you know the work, rename it if you have "
+            "a tool for that (in the desktop app, mcp__ccd_session_mgmt__set_session_title with session_id \"self\"): "
+            "at most 30 characters, in the user's language, naming the work being continued.")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": hint}}))
 
 
