@@ -131,7 +131,8 @@ class SessionsTest(unittest.TestCase):
         self.assertFalse(s["rename"])
 
     def test_vague_and_similar_titles(self):
-        for t in ("Session", "계속 진행", "HANDOFF.md 검토 및 진행", "Read the handoff and continue", "새 대화"):
+        for t in ("Session", "계속 진행", "HANDOFF.md 검토 및 진행", "Read the handoff and continue", "새 대화",
+                  "작업 이어가기", "작업 이어가자", "계속하기", "이어서 하자", "Continue the work", "Pick up where we left off"):
             self.assertTrue(sessions.is_vague(t), t)
         for t in ("AI 인수인계 수리 감사", "my-app 데모 운영", "주간 보고서 자동화"):
             self.assertFalse(sessions.is_vague(t), t)

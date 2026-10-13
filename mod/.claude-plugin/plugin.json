@@ -1,6 +1,6 @@
 {
   "name": "tokenrx",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "TokenRx: shows your usage limits, this chat's size and the minutes left on its prompt cache above the prompt, keeps a long chat's cache warm while you are away (or warns, or compacts) before it cools, and tidies the desktop chat list (/tokenrx:tidy).",
   "author": {
     "name": "latentcairn"

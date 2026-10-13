@@ -44,8 +44,11 @@ CACHE_PRICES = {
 }
 
 # 내용을 말해 주지 않는 제목. 인수인계 문서를 읽고 시작한 대화는 앱이 "HANDOFF.md 검토" 같은 제목을 붙인다.
-VAGUE = re.compile(r"^(session|new (session|chat|conversation)|untitled|chat|conversation|continue( work(ing)?)?|resume|"
-                   r"새 ?(대화|세션)|대화|세션|계속( 진행| 작업| 해줘|해)?|이어서( 진행| 작업| 해줘| 하기)?|이어가기)$", re.I)
+# "작업 이어가자"처럼 이어 달라는 말만으로 연 대화는 앱이 "작업 이어가기" 같은 제목을 붙인다.
+VAGUE = re.compile(r"^(session|new (session|chat|conversation)|untitled|chat|conversation|resume|"
+                   r"(continue|keep going|pick up)( (the |where )?(work(ing)?|task|session|chat|we left off))?|"
+                   r"새 ?(대화|세션)|대화|세션|(작업 ?)?(계속(하기|하자|해|해줘| 진행| 작업| 해줘)?|"
+                   r"이어서( 진행| 작업| 해줘| 하기| 하자)?|이어(가기|가자|하기)|재개(하기)?))$", re.I)
 VAGUE_HANDOFF = re.compile(r"(handoff|핸드오프|인수인계)\S*\s*(문서\s*|파일\s*)?(검토|읽|확인|진행|이어|따라|review|read|check|"
                            r"continu|follow)|(read|읽고)\s+(the\s+)?(handoff|핸드오프|인수인계)", re.I)
 
