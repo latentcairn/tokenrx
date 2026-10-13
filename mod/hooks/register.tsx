@@ -1,5 +1,5 @@
 // TokenRx mod: 입력창 위에 한도, 이 대화의 크기, 캐시가 식기까지 남은 시간을 보여 준다.
-// 캐시가 식기 직전에 한 번 알리거나(설정 autoCompact=on이면 자동으로 압축하고), 한도가 바뀔 때마다 ~/.claude/tokenrx/limits.jsonl에 남긴다
+// 캐시가 식기 직전에 한 번 알리거나(설정 keepAlive=12h 등이면 그때까지 짧은 신호로 살려 두고, autoCompact=on이면 자동으로 압축하고), 한도가 바뀔 때마다 ~/.claude/tokenrx/limits.jsonl에 남긴다
 // (진단서의 한도 예보가 읽는 파일. 데스크톱 앱은 상태 표시줄을 실행하지 않아서 이 mod가 대신 쓴다).
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
@@ -172,8 +172,22 @@ async function measure($: EngineInterface, u: { context: { tokens?: number; wind
 }
 
 let isWorking = false
-let warnedFor: number | null = null   // 이 마지막 응답 시각에 대해서는 이미 알렸다(또는 압축했다)
+let warnedFor: number | null = null   // 이 마지막 응답 시각에 대해서는 이미 알렸다(또는 압축했다, 살려 뒀다)
 let autoCompact = false
+let keepAliveMs = 0                   // 0이면 끔. 사람이 마지막으로 쓴 뒤 이만큼까지 캐시를 살려 둔다
+let idleSince: number | null = null   // 사람이 쓴 마지막 턴이 끝난 시각(살려 두기 턴은 빼고)
+let pinging = false                   // 살려 두기 신호를 보냈고, 그 턴이 아직 시작하지 않았다
+let pingTurn: string | null = null    // 지금 도는 살려 두기 턴
+
+/** 설정값 '12h'를 밀리초로. 'off'나 모르는 값은 0. */
+export function keepAliveOf(v: unknown) {
+  const m = /^(\d+)h$/.exec(String(v ?? ''))
+  return m ? Number(m[1]) * 3_600_000 : 0
+}
+
+const pingText = () =>
+  L("[TokenRx 살려 두기] 자리를 비운 사이 이 대화의 캐시가 식지 않게 보낸 자동 신호예요. 아무 작업도 하지 말고 '.' 한 글자만 답하세요.",
+    "[TokenRx keep-alive] An automatic nudge that keeps this chat's cache warm while the user is away. Do nothing and reply with a single '.'.")
 
 // 자리를 비운 사이 압축할 때 요약에 꼭 남길 것
 const COMPACT_INSTRUCTIONS =
@@ -210,16 +224,37 @@ async function compactNow($: EngineInterface) {
   }
 }
 
+/**
+ * 캐시가 식기 전에 아주 짧은 턴을 하나 돌려 캐시를 새로 한다. 다시 저장하는 값의 약 40분의 1이다(1시간 캐시).
+ * 신호가 들어갔으면 true, 못 들어갔으면(다른 플러그인이 막음, 오류) false.
+ */
+async function keepAlive($: EngineInterface) {
+  pinging = true
+  try {
+    const res = await $.prompt.submit({ text: pingText() })
+    if ('drop' in res) {
+      pinging = false
+      return false
+    }
+    return true
+  } catch {
+    pinging = false
+    return false
+  }
+}
+
 async function tick($: EngineInterface) {
   try {
     const t = await $.clock.now()
     await update($, now, () => t)
     const last = await read($, lastReplyAt)
-    if (isWorking || last === null || warnedFor === last) return
+    if (isWorking || pinging || last === null || warnedFor === last) return
     const r = await read($, reading)
     const text = coolingNotice(r, last, t)
     if (!text) return
     warnedFor = last
+    // 1시간 캐시(구독)만 살려 둔다. 5분 캐시는 신호를 너무 자주 보내야 해서 다시 저장하는 편이 싸다
+    if (keepAliveMs && r?.limits.length && t - (idleSince ?? last) < keepAliveMs && (await keepAlive($))) return
     if (autoCompact && (await compactNow($))) {
       $.ui.toast(L(`[TokenRx] 캐시가 식기 전에 이 대화(${tokens(r?.tokens ?? 0)} 토큰)를 자동으로 압축했어요. 돌아와서 그대로 이어가도 싸요.`,
                    `[TokenRx] Compacted this chat (${tokens(r?.tokens ?? 0)} tokens) before its cache cooled. You can pick it up cheaply.`))
@@ -234,6 +269,7 @@ async function tick($: EngineInterface) {
 export const register: Register = (on, options) => {
   lang = pickLang(options?.lang, undefined)
   autoCompact = options?.autoCompact === 'on'
+  keepAliveMs = keepAliveOf(options?.keepAlive)
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
@@ -245,12 +281,16 @@ export const register: Register = (on, options) => {
       // 설정을 못 읽으면 엔진이 준 값대로 돈다
     }
     autoCompact = opts?.autoCompact === 'on'
+    keepAliveMs = keepAliveOf(opts?.keepAlive)
     try {
       lang = pickLang(opts?.lang, await $.env.get('TOKENRX_LANG'))
       const id = await $.session.id()
       const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>
       const last = seen[id]
-      if (typeof last === 'number') await update($, lastReplyAt, () => last)
+      if (typeof last === 'number') {
+        await update($, lastReplyAt, () => last)
+        idleSince ??= last
+      }
       await measure($, await $.session.usage())
       const t = await $.clock.now()
       await update($, now, () => t)
@@ -263,14 +303,21 @@ export const register: Register = (on, options) => {
 
   on('turn.start', ($, e, next) => {
     isWorking = true
+    if (pinging) {
+      pingTurn = e.turnId
+      pinging = false
+    }
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId) return next(e)   // 서브에이전트의 턴은 이 대화의 캐시를 새로 하지 않는다
     isWorking = false
+    const wasPing = e.turnId === pingTurn
+    pingTurn = null
     try {
       const t = await $.clock.now()
+      if (!wasPing) idleSince = t   // 살려 두기 턴은 캐시만 새로 하고, 사람이 쓴 시각은 그대로 둔다
       await update($, lastReplyAt, () => t)
       await update($, now, () => t)
       const id = await $.session.id()

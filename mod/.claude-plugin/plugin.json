@@ -1,7 +1,7 @@
 {
   "name": "tokenrx",
-  "version": "0.3.2",
-  "description": "TokenRx: shows your usage limits, this chat's size and the minutes left on its prompt cache above the prompt, warns (or compacts) before the cache cools, and tidies the desktop chat list (/tokenrx:tidy).",
+  "version": "0.3.3",
+  "description": "TokenRx: shows your usage limits, this chat's size and the minutes left on its prompt cache above the prompt, keeps a long chat's cache warm while you are away (or warns, or compacts) before it cools, and tidies the desktop chat list (/tokenrx:tidy).",
   "author": {
     "name": "latentcairn"
   },
@@ -25,6 +25,19 @@
       "options": [
         "off",
         "on"
+      ],
+      "default": "off"
+    },
+    "keepAlive": {
+      "type": "string",
+      "title": "Keep alive",
+      "description": "Keep a 100K+ token chat's cache warm while you are away: 5 minutes before it cools, send a one-line nudge (about 1/40 of re-saving it), for up to this long after your last message; then compact (if on) or warn. Subscription accounts only; the PC and the app must stay on.",
+      "options": [
+        "off",
+        "4h",
+        "8h",
+        "12h",
+        "24h"
       ],
       "default": "off"
     }

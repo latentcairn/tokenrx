@@ -157,6 +157,103 @@ test('with autoCompact on, falls back to the warning when compaction is refused'
   expect(toasts[0]).toContain('/compact')
 })
 
+// 살려 두기: 엔진이 하는 일(신호가 들어가면 짧은 턴이 돈다)을 손으로 흉내 낸다
+function pings(on: On) {
+  const texts: string[] = []
+  on('prompt.submit', ($, e) => {
+    texts.push(e.text)
+    return { text: e.text }
+  })
+  return texts
+}
+
+async function pingTurn($: Engine, n: number) {
+  await $.turn.start({ text: 'ping', turnId: `p${n}` })
+  await $.turn.complete({ answer: '.', durationMs: 500, isAborted: false, turnId: `p${n}`, reason: 'answer' })
+}
+
+test('with keepAlive, nudges a long idle chat before its cache cools, every hour, without counting it as the user', { options: { keepAlive: '4h' } }, async ($, on) => {
+  const { clock, toasts } = world(on)
+  const sent = pings(on)
+  await startAndReply($)
+  await clock.advance(54 * MIN)
+  expect(sent.length).toBe(0)
+  await clock.advance(2 * MIN)
+  expect(sent.length).toBe(1)
+  expect(sent[0]).toContain('살려 두기')
+  expect(toasts.length).toBe(0)
+  await pingTurn($, 1)
+  expect(await bandText($)).toContain('60분 남음')
+  // 4시간이 될 때까지 한 시간마다 한 번
+  for (let i = 2; i <= 4; i++) {
+    await clock.advance(54 * MIN)
+    expect(sent.length).toBe(i - 1)
+    await clock.advance(2 * MIN)
+    expect(sent.length).toBe(i)
+    await pingTurn($, i)
+  }
+  // 사람이 마지막으로 쓴 지 4시간이 넘으면 더 살리지 않고 알린다
+  await clock.advance(56 * MIN)
+  expect(sent.length).toBe(4)
+  expect(toasts.length).toBe(1)
+  expect(toasts[0]).toContain('/compact')
+})
+
+test('with keepAlive, a message from the user restarts the window', { options: { keepAlive: '4h' } }, async ($, on) => {
+  const { clock } = world(on)
+  const sent = pings(on)
+  await startAndReply($)
+  for (let i = 1; i <= 3; i++) {
+    await clock.advance(56 * MIN)
+    await pingTurn($, i)
+  }
+  await $.turn.start({ text: '돌아왔어', turnId: 't2' })
+  await $.turn.complete({ answer: '네', durationMs: 1000, isAborted: false, turnId: 't2', reason: 'answer' })
+  for (let i = 4; i <= 7; i++) {
+    await clock.advance(56 * MIN)
+    expect(sent.length).toBe(i)
+    await pingTurn($, i)
+  }
+})
+
+test('with keepAlive and autoCompact, compacts once the keep-alive window ends', { options: { keepAlive: '4h', autoCompact: 'on' } }, async ($, on) => {
+  const { clock, toasts } = world(on)
+  const sent = pings(on)
+  const compacts: unknown[] = []
+  on('session.compact', ($, e) => {
+    compacts.push(e)
+    return { messages: [{ role: 'user' as const, text: '요약', toolUses: [] }], tokensBefore: 255_186, tokensAfter: 20_000 }
+  })
+  await startAndReply($)
+  for (let i = 1; i <= 4; i++) {
+    await clock.advance(56 * MIN)
+    await pingTurn($, i)
+  }
+  expect(compacts.length).toBe(0)
+  await clock.advance(56 * MIN)
+  expect(sent.length).toBe(4)
+  expect(compacts.length).toBe(1)
+  expect(toasts[0]).toContain('자동으로 압축')
+})
+
+test('with keepAlive, a refused nudge falls back to the warning', { options: { keepAlive: '4h' } }, async ($, on) => {
+  const { clock, toasts } = world(on)
+  on('prompt.submit', () => ({ drop: 'blocked' }))
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  expect(toasts.length).toBe(1)
+  expect(toasts[0]).toContain('/compact')
+})
+
+test('keepAlive is off unless chosen', async ($, on) => {
+  const { clock, toasts } = world(on)
+  const sent = pings(on)
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  expect(sent.length).toBe(0)
+  expect(toasts.length).toBe(1)
+})
+
 // 데스크톱 앱은 설치본을 'inline'으로 넘겨서 엔진이 pluginConfigs["tokenrx@latentcairn"]을 읽지 않는다(기본값 off로 시작)
 const INSTALLED_ON = { pluginConfigs: { 'tokenrx@latentcairn': { options: { lang: 'ko', autoCompact: 'on' } } } }
 const ENV = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\profiles\t' }
