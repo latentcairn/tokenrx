@@ -7,3 +7,8 @@ hooks/*.json
 hooks/*.jsonl
 sample-data/
 eval-out/
+# 이 PC 작업 기록(계정, 대화 번호, 사용량이 들어 있음)
+HANDOFF*.md
+docs/절약 점검 기록.md
+# 이 PC 전용 Claude Code 설정
+.claude/settings.local.json
