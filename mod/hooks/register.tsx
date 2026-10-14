@@ -2,7 +2,7 @@
 // 캐시가 식기 직전에 한 번 알리거나(설정 keepAlive=12h 등이면 그때까지 짧은 신호로 살려 두고, autoCompact=on이면 자동으로 압축하고), 한도가 바뀔 때마다 ~/.claude/tokenrx/limits.jsonl에 남긴다
 // (진단서의 한도 예보가 읽는 파일. 데스크톱 앱은 상태 표시줄을 실행하지 않아서 이 mod가 대신 쓴다).
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
 import type { Limit, Reading } from '../types'
 
@@ -24,7 +24,8 @@ const CACHE_PRICES: Record<string, readonly [number, number, number]> = {
   'claude-haiku-5': [0.125, 0.2, 0.01], 'claude-haiku-4': [1.25, 2, 0.1],
 }
 
-export type Part = { key: 'limits' | 'context' | 'cache'; text: string; color?: 'warning' | 'error' }
+// newChat: 캐시가 식은 긴 대화. 데스크톱 앱에서는 옆에 '새 대화로 이어가기' 버튼을 단다
+export type Part = { key: 'limits' | 'context' | 'cache'; text: string; color?: 'warning' | 'error'; newChat?: true }
 
 let lang: 'ko' | 'en' = 'en'
 const L = (ko: string, en: string) => (lang === 'ko' ? ko : en)
@@ -98,7 +99,7 @@ export function bandParts(r: Reading | null, last: number | null, t: number, isW
     } else if (big) {
       const p = cachePrice(r.model)
       const usd = p ? ` (${L('정가 약', 'about')} $${((r.tokens * (p[r.limits.length ? 1 : 0] - p[2])) / 1e6).toFixed(2)})` : ''
-      parts.push({ key: 'cache', color: 'warning',
+      parts.push({ key: 'cache', color: 'warning', newChat: true,
                    text: L(`캐시가 식었어요. 지금 보내면 대화 전체를 다시 저장해요${usd}. 새 대화로 이어가는 게 싸요`,
                            `Cache expired: sending now re-saves the whole chat${usd}. A new chat is cheaper`) })
     } else {
@@ -307,6 +308,284 @@ async function keepAlive($: EngineInterface): Promise<string | null> {
   }
 }
 
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+const NOTE_BUDGET = 8_000   // 메모에 넣는 요청 글자 수 한도(약 2~3천 토큰). hooks/idle_guard.py와 같은 값
+const COMPACTED = 'This session is being continued from a previous conversation'
+
+function clip(text: string, limit: number, tail = false) {
+  const t = text.trim()
+  if (t.length <= limit) return t
+  return tail ? `… ${t.slice(-limit)}` : `${t.slice(0, limit)} …`
+}
+
+const oneLine = (text: string) => text.split(/\s+/).filter(Boolean).join(' ')
+
+/** 프로젝트 인수인계 문서(HANDOFF.md 같은 것)인가. idle_guard.py의 _is_doc과 같다. */
+export function isHandoffDoc(path: string) {
+  const name = (path.split(/[\\/]/).pop() ?? '').toLowerCase()
+  return name.startsWith('handoff') && (name.endsWith('.md') || name.endsWith('.txt'))
+}
+
+/** 사람이 직접 쓴 요청의 글. 명령, 시스템 알림, 살려 두기 신호, 중단 표시는 빈 글. */
+export function requestText(text: string) {
+  const t = text.replace(/<([a-z][\w-]*)>[\s\S]*?<\/\1>/g, '').trim()
+  if (!t || t.startsWith('<') || t.startsWith('[Request interrupted') || t.startsWith('[TokenRx')) return ''
+  return t
+}
+
+/** 답의 첫 줄. 답은 결론부터 쓰므로 이 한 줄이 그 턴의 요약 역할을 한다. */
+function gist(text: string) {
+  for (const ln of text.split('\n')) {
+    const t = ln.trim().replace(/^[#>*\-| ]+/, '').trim()
+    if (t) return clip(t, 200)
+  }
+  return ''
+}
+
+function when(ms: number, ref: number) {
+  const d = new Date(ms)
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return new Date(ref).toDateString() === d.toDateString() ? hm : `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${hm}`
+}
+
+export type NoteFacts = {
+  folder: string
+  sessionId: string
+  transcript?: string                                    // 원본 대화 기록 파일(찾았을 때만)
+  lastReplyAt: number | null
+  now: number
+  docs: readonly { path: string; mtimeMs: number }[]     // 작업 폴더의 인수인계 문서
+}
+
+/**
+ * 새 대화가 이어받을 메모. 요청과 답의 요지, 마지막 응답, 수정한 파일, 할 일 목록을 담는다(hooks/idle_guard.py의
+ * write_handoff를 mod로 옮긴 것). 새 대화는 대화 전체 대신 이 메모 몇천 토큰만 읽으면 된다. 담을 것이 없으면 undefined.
+ */
+export function handoffNote(messages: readonly SessionMessage[], f: NoteFacts): string | undefined {
+  type Turn = { prompt: string; replies: string[] }
+  const turns: Turn[] = []
+  const files = new Map<string, number>()   // 고친 파일 → 몇 번째 고침인지(마지막 것)
+  let edits = 0
+  let docEdit = -1                          // 이 대화에서 인수인계 문서를 마지막으로 고친 차례
+  let docTurn = -1                          // 그 턴
+  let todos: unknown[] = []
+  let summary = ''
+  let ping = false                          // 살려 두기 신호에 답하는 중이다(그 답은 넣지 않는다)
+  for (const m of messages) {
+    if (m.role === 'user') {
+      const raw = m.text.trim()
+      if (raw.startsWith(COMPACTED)) {
+        summary = raw
+        continue
+      }
+      if (raw.startsWith('[TokenRx 살려 두기]') || raw.startsWith('[TokenRx keep-alive]')) {
+        ping = true
+        continue
+      }
+      const t = requestText(m.text)
+      if (t) {
+        turns.push({ prompt: t, replies: [] })
+        ping = false
+      }
+      continue
+    }
+    if (ping) continue
+    if (!turns.length) turns.push({ prompt: '', replies: [] })   // 앞부분 없이 응답부터 시작
+    const turn = turns[turns.length - 1]!
+    if (m.text.trim()) turn.replies.push(m.text)
+    for (const u of m.toolUses) {
+      const p = u.input['file_path']
+      if (EDIT_TOOLS.has(u.tool) && typeof p === 'string') {
+        edits += 1
+        files.delete(p)
+        files.set(p, edits)
+        if (isHandoffDoc(p)) {
+          docEdit = edits
+          docTurn = turns.length - 1
+        }
+      } else if (u.tool === 'TodoWrite' && Array.isArray(u.input['todos'])) {
+        todos = u.input['todos']
+      }
+    }
+  }
+  const replies = turns.length ? turns[turns.length - 1]!.replies : []
+  if (!turns.some(t => t.prompt) && !replies.length && !summary) return undefined
+
+  // 인수인계 문서를 이 대화에서 고쳤다면, 그 뒤에 들어온 요청과 그 뒤에 고친 파일은 문서에 아직 없다
+  const docs = f.docs.length > 0
+  const lateTurn = (i: number) => docs && docTurn >= 0 && i > docTurn
+  const lateFile = (p: string) => docs && docEdit >= 0 && (files.get(p) ?? 0) > docEdit && !isHandoffDoc(p)
+  const ref = f.lastReplyAt ?? f.now
+  const out = [
+    `# ${L('이전 대화 인수인계', 'Handoff from a previous conversation')}`, '',
+    L('TokenRx가 캐시가 식은 긴 대화를 새 대화로 옮기려고 이 PC 안에서 만든 메모예요. 이 메모를 읽는 AI에게:',
+      'TokenRx wrote this note on this PC so a long conversation whose cache cooled can go on in a new one. For the AI reading it:'),
+    L('- 사람에게 맥락을 다시 묻지 말고 이 메모로 이어서 하세요. 메모에 없는 내용은 원본 대화 기록에서 검색해 필요한 부분만 읽으세요(전체를 읽지 마세요).',
+      "- Don't ask the person to repeat the context; continue from this note. For anything it leaves out, search the original transcript and read only what you need (not the whole file)."),
+    L('- 데스크톱 앱이면, 이어서 하는 일이 무엇인지 알게 된 뒤 이 대화의 제목을 바꾸세요(mcp__ccd_session_mgmt__set_session_title, session_id "self", 30자 이내, 사람의 언어로).',
+      '- In the desktop app, once you know the work, rename this chat (mcp__ccd_session_mgmt__set_session_title with session_id "self": at most 30 characters, in the person\'s language).'),
+    '',
+    `- ${L('작업 폴더', 'Working folder')}: ${f.folder}`,
+    `- ${L('이전 대화 ID', 'Previous conversation ID')}: ${f.sessionId}`,
+    ...(f.lastReplyAt ? [`- ${L('마지막 응답 시각', 'Last reply at')}: ${when(f.lastReplyAt, f.now)}`] : []),
+    ...(f.transcript ? [`- ${L('원본 대화 기록', 'Original transcript')}: ${f.transcript}`] : []),
+    '',
+  ]
+  if (docs) {
+    out.push(`## ${L('프로젝트 인수인계 문서', 'Project handoff doc')}`, '')
+    for (const d of f.docs) out.push(`- ${d.path} (${L('마지막 수정', 'last edited')} ${when(d.mtimeMs, ref)})`)
+    out.push('')
+    const late = turns.filter((t, i) => t.prompt && lateTurn(i)).length
+    const lateFiles = [...files.keys()].filter(lateFile).length
+    if (late || lateFiles) {
+      out.push(L(`⚠ 문서를 마지막으로 고친 뒤에도 대화가 이어졌어요. 문서에 아직 없는 요청 ${late}개와 파일 ${lateFiles}개를 아래에 ⚠로 표시했어요. ` +
+                 '이어서 하기 전에 이 메모와 원본 기록으로 문서를 먼저 최신으로 고치세요.',
+                 `⚠ The conversation went on after the doc was last edited. ${late} request(s) and ${lateFiles} file(s) not in the doc yet ` +
+                 'are marked ⚠ below. Before continuing, bring the doc up to date from this note and the original transcript.'))
+    } else if (docEdit < 0 && files.size) {
+      out.push(L('이 문서부터 읽으세요. 다만 남아 있는 기록에서는 이 문서를 고친 적이 없어요. 아래 수정한 파일이 문서에 담겼는지 확인하세요.',
+                 "Read this doc first. The part of the conversation still on record never edited it, though: check that the files below are in it."))
+    } else {
+      out.push(L('✅ 문서가 이 대화의 마지막 작업까지 담고 있어요. 이 문서부터 읽으세요.',
+                 '✅ The doc covers this conversation up to its last piece of work. Read it first.'))
+    }
+    out.push('')
+  }
+  if (summary) {
+    out.push(`## ${L('앞부분 요약(자동 압축 때 만든 것)', 'Summary of the earlier part (made at compaction)')}`, '', clip(summary, 6000), '')
+  }
+
+  const items: [string, string][] = []   // (요청 줄, 답 요지 줄)
+  turns.forEach((t, i) => {
+    if (!t.prompt) return
+    const g = t.replies.length && i < turns.length - 1 ? gist(t.replies[t.replies.length - 1]!) : ''
+    items.push([`${lateTurn(i) ? '⚠ ' : ''}${clip(oneLine(t.prompt), 600)}`, g ? `   → ${g}` : ''])
+  })
+  if (items.length) {
+    // 첫 요청(보통 일의 목표)은 늘 넣고, 나머지는 최근 것부터 분량 한도까지 넣는다
+    const size = (it: [string, string]) => it[0].length + it[1].length
+    const rest: [string, string][] = []
+    let used = size(items[0]!)
+    for (const it of items.slice(1).reverse()) {
+      if (used + size(it) > NOTE_BUDGET) break
+      rest.unshift(it)
+      used += size(it)
+    }
+    const skipped = items.length - 1 - rest.length
+    out.push(`## ${L('요청과 답의 요지 (오래된 것부터)', 'Requests and answer gists (oldest first)')}`, '')
+    ;[items[0]!, ...rest].forEach(([req, g], i) => {
+      out.push(`${i === 0 ? 1 : i + 1 + skipped}. ${req}`)
+      if (g) out.push(g)
+      if (i === 0 && skipped) out.push(L(`   … 중간 요청 ${skipped}개 생략`, `   … ${skipped} requests in between left out`))
+    })
+    out.push('')
+  }
+  if (replies.length) out.push(`## ${L('마지막 응답', 'Last reply')}`, '', clip(replies.join('\n\n'), 6000, true), '')
+  if (files.size) {
+    out.push(`## ${L('이 대화에서 수정한 파일', 'Files edited in this conversation')}`, '')
+    for (const p of [...files.keys()].slice(-30)) out.push(`- ${lateFile(p) ? '⚠ ' : ''}${p}`)
+    out.push('')
+  }
+  const todoLines = todos.slice(0, 30).flatMap(t =>
+    t && typeof t === 'object' ? [`- [${(t as Record<string, unknown>)['status'] === 'completed' ? 'x' : ' '}] ${clip(String((t as Record<string, unknown>)['content'] ?? ''), 200)}`] : [])
+  if (todoLines.length) out.push(`## ${L('할 일 목록', 'Todo list')}`, '', ...todoLines, '')
+  return out.join('\n')
+}
+
+/** 데스크톱 앱이 받는 '이 폴더에 새 Code 대화' 주소. q는 입력창에 넣을 첫 메시지. */
+export function newChatLink(folder: string, prompt: string) {
+  return `claude://code/new?folder=${encodeURIComponent(folder)}&q=${encodeURIComponent(prompt)}`
+}
+
+/** 주소를 OS에 넘겨 연다(claude://는 데스크톱 앱이 받는다). 열었으면 null, 못 열었으면 그 까닭. */
+async function openLink($: EngineInterface, url: string): Promise<string | null> {
+  const tries = (await $.env.get('OS')) === 'Windows_NT'
+    ? [['rundll32.exe', 'url.dll,FileProtocolHandler', url]]
+    : [['open', url], ['xdg-open', url]]
+  let why = 'no opener'
+  for (const argv of tries) {
+    try {
+      const r = await $.process.run(argv, { timeoutMs: 15_000 })
+      if (r.exitCode === 0) return null
+      why = `${argv[0]} exit ${r.exitCode}: ${clip(r.stderr, 200)}`
+    } catch (err) {
+      why = `${argv[0]}: ${reason(err)}`
+    }
+  }
+  return why
+}
+
+/** 사람과 새 대화에 보여 줄 경로: Windows 경로면 구분자를 \로 맞춘다. */
+const native = (p: string) => (p.includes('\\') ? p.replace(/\//g, '\\') : p)
+
+/** 대화 기록 파일이 있을 자리(~/.claude/projects/<폴더 이름의 글자·숫자 말고는 '-'>/<id>.jsonl). 없으면 undefined. */
+async function transcriptOf($: EngineInterface, home: string, folder: string, id: string) {
+  const path = native(`${home}/projects/${folder.replace(/[^a-zA-Z0-9]/g, '-')}/${id}.jsonl`)
+  try {
+    return (await $.fs.exists(path)) ? path : undefined
+  } catch {
+    return undefined
+  }
+}
+
+let opening = false
+
+/**
+ * '새 대화로 이어가기' 버튼: 인수인계 메모를 ~/.claude/tokenrx/handoff/에 남기고(대화 정리 기능이 이 이름으로
+ * 넘어간 대화를 알아본다), 같은 폴더에 새 대화를 열어 메모를 읽으라는 첫 메시지를 넣는다.
+ */
+async function continueInNewChat($: EngineInterface) {
+  if (opening) return
+  opening = true
+  try {
+    const t = await $.clock.now()
+    const id = await $.session.id()
+    const folder = await $.session.root()
+    const home = await claudeHome($)
+    let note: string | undefined
+    let docs: { path: string; mtimeMs: number }[] = []
+    try {
+      docs = (await $.fs.list(folder)).filter(e => e.kind === 'file' && isHandoffDoc(e.name))
+        .map(e => ({ path: `${folder.replace(/[\\/]+$/, '')}${folder.includes('\\') ? '\\' : '/'}${e.name}`, mtimeMs: e.mtimeMs }))
+    } catch {
+      docs = []
+    }
+    try {
+      const messages = await $.session.messages()
+      note = handoffNote(messages, { folder, sessionId: id, lastReplyAt: await read($, lastReplyAt), now: t, docs,
+                                     ...(home ? { transcript: await transcriptOf($, home, folder, id) } : {}) })
+    } catch {
+      note = undefined   // 메모를 못 만들어도 새 대화는 연다
+    }
+    let path: string | undefined
+    if (note && home) {
+      const d = new Date(t)
+      const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+      path = native(`${home}/tokenrx/handoff/${stamp}-${id.slice(0, 8)}.md`)
+      try {
+        await $.fs.write(path, note)
+      } catch {
+        path = undefined
+      }
+    }
+    const prompt = path
+      ? L(`이전 대화를 이어서 해줘. TokenRx 인수인계 메모부터 읽어: ${path}`,
+          `Continue the previous conversation. Read the TokenRx handoff note first: ${path}`)
+      : L('이전 대화를 이어서 해줘.', 'Continue the previous conversation.')
+    const why = await openLink($, newChatLink(folder, prompt))
+    await logEvent($, 'new_chat', { ok: why === null, ...(why ? { why } : {}), note: path !== undefined })
+    $.ui.toast(why === null
+      ? L('[TokenRx] 같은 폴더에 새 대화를 열었어요. 첫 메시지를 보내면 인수인계 메모를 읽고 이어가요.',
+          '[TokenRx] Opened a new chat in this folder. Send its first message and it picks up from the handoff note.')
+      : L(`[TokenRx] 새 대화를 열지 못했어요. 새 대화 버튼으로 이 폴더를 열고 "${prompt}"라고 보내세요.`,
+          `[TokenRx] Couldn't open a new chat. Start one in this folder and send: "${prompt}"`))
+  } catch {
+    // 버튼이 실패해도 대화에는 영향을 주지 않는다
+  } finally {
+    opening = false
+  }
+}
+
 /** 30초마다 도는 타이머를 (다시) 켠다. 엔진이 한 주기라도 거절하면 그 타이머는 끝나므로, 멈춘 것을 보면 다시 켠다. */
 function startTicking($: EngineInterface) {
   stopTick?.()
@@ -467,7 +746,9 @@ export const register: Register = (on, options) => {
     const t = Math.max(await read($, now), last ?? 0)
     const parts = bandParts(await read($, reading), last, t, e.props.isWorking)
     if (!parts.length) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    // claude://로 새 대화를 여는 것은 데스크톱 앱뿐이다
+    const newChat = e.surface === 'desktop' && parts.some(p => p.newChat)
     return (
       <Box key="tokenrx">
         <Text dimColor>TokenRx · </Text>
@@ -476,6 +757,10 @@ export const register: Register = (on, options) => {
             {i ? ` · ${p.text}` : p.text}
           </Text>
         ))}
+        {newChat ? [
+          <Text key="gap"> </Text>,
+          <Button key="newchat" label={L('새 대화로 이어가기', 'Continue in a new chat')} onPress={() => void continueInNewChat($)} />,
+        ] : []}
       </Box>
     )
   })

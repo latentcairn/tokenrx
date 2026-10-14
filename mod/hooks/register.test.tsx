@@ -389,3 +389,107 @@ test('a value set for the inline copy itself wins over the one saved at install'
   expect(compacts.length).toBe(0)
   expect(toasts[0]).toContain('/compact')
 })
+
+// '새 대화로 이어가기' 버튼: 캐시가 식은 긴 대화에서 인수인계 메모를 남기고 같은 폴더에 새 대화를 연다
+const WIN = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t', OS: 'Windows_NT' }
+const MESSAGES = [
+  { role: 'user' as const, text: 'This session is being continued from a previous conversation that ran out of context. 요약: mod 0.3.6 설치함', toolUses: [] },
+  { role: 'user' as const, text: '버튼을 만들자<system-reminder>무시할 알림</system-reminder>', toolUses: [] },
+  { role: 'assistant' as const, text: '버튼을 만들었어요.\n자세히는 이래요.', toolUses: [
+    { tool_use_id: 'a', tool: 'Edit', input: { file_path: 'D:\\work\\proj\\mod\\a.tsx' } },
+    { tool_use_id: 'b', tool: 'Edit', input: { file_path: 'D:\\work\\proj\\HANDOFF.md' } },
+  ] },
+  { role: 'user' as const, text: '', toolUses: [] },
+  { role: 'user' as const, text: "[TokenRx 살려 두기] 자동 신호예요. '.' 한 글자만 답하세요.", toolUses: [] },
+  { role: 'assistant' as const, text: '.', toolUses: [] },
+  { role: 'user' as const, text: '테스트도 고쳐', toolUses: [] },
+  { role: 'assistant' as const, text: '테스트를 고쳤어요.', toolUses: [
+    { tool_use_id: 'c', tool: 'Write', input: { file_path: 'D:\\work\\proj\\mod\\a.test.tsx' } },
+  ] },
+]
+
+function newChatWorld(on: On, exitCode = 0) {
+  const w = world(on, WIN)
+  const runs: (readonly string[])[] = []
+  on('session.root', () => ({ value: 'D:\\work\\proj' }))
+  on('session.messages', () => ({ value: MESSAGES }))
+  on('fs.list', () => ({ value: [
+    { name: 'HANDOFF.md', kind: 'file' as const, size: 10, mtimeMs: T0, isLink: false },
+    { name: 'README.md', kind: 'file' as const, size: 10, mtimeMs: T0, isLink: false },
+  ] }))
+  on('fs.exists', () => ({ value: true }))
+  on('process.run', ($, e) => {
+    runs.push(e.argv)
+    return { value: { exitCode, stdout: '', stderr: exitCode ? 'nope' : '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  return { ...w, runs }
+}
+
+async function pressNewChat($: Engine) {
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'newchat' })
+  await ui.unmount()
+}
+
+test('a long chat whose cache cooled shows a new-chat button, on desktop only', async ($, on) => {
+  const { clock } = newChatWorld(on)
+  await startAndReply($)
+  const button = async (surface: (typeof SURFACES)[number]) => {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    const found = await ui.find({ key: 'newchat' })
+    await ui.unmount()
+    return found
+  }
+  expect(await button('desktop')).toBeUndefined()   // 캐시가 살아 있으면 없다
+  await clock.advance(61 * MIN)
+  expect(await button('desktop')).toBeDefined()
+  expect(await button('terminal')).toBeUndefined()
+})
+
+test('the new-chat button leaves a handoff note and opens this folder in a new chat', async ($, on) => {
+  const { clock, writes, runs, toasts } = newChatWorld(on)
+  await startAndReply($)
+  await clock.advance(61 * MIN)
+  await pressNewChat($)
+  const note = writes.find(w => w.path.includes('handoff'))
+  expect(note?.path.replace(/\\/g, '/')).toMatch(/^D:\/profiles\/t\/\.claude\/tokenrx\/handoff\/\d{8}-\d{6}-s1\.md$/)
+  const text = note?.text ?? ''
+  expect(text).toContain('요약: mod 0.3.6 설치함')
+  expect(text).toContain('1. 버튼을 만들자')
+  expect(text).toContain('   → 버튼을 만들었어요.')
+  expect(text).toContain('2. ⚠ 테스트도 고쳐')
+  expect(text).toContain('요청 1개와 파일 1개')
+  expect(text).toContain('- D:\\work\\proj\\mod\\a.tsx')
+  expect(text).toContain('- ⚠ D:\\work\\proj\\mod\\a.test.tsx')
+  expect(text).toContain('D:\\work\\proj\\HANDOFF.md')
+  expect(text).not.toContain('README.md')
+  expect(text).toContain('테스트를 고쳤어요.')
+  expect(text).toContain('D:\\profiles\\t\\.claude\\projects\\D--work-proj\\s1.jsonl')
+  expect(text).toContain('set_session_title')
+  expect(text).not.toContain('살려 두기')
+  expect(text).not.toContain('무시할 알림')
+  expect(runs.length).toBe(1)
+  expect(runs[0]?.slice(0, 2)).toEqual(['rundll32.exe', 'url.dll,FileProtocolHandler'])
+  const url = new URL(runs[0]?.[2] ?? '')
+  expect(url.protocol).toBe('claude:')
+  expect(url.host).toBe('code')
+  expect(url.pathname).toBe('/new')
+  expect(url.searchParams.get('folder')).toBe('D:\\work\\proj')
+  expect(url.searchParams.get('q')).toContain(note?.path ?? '-')
+  expect(toasts.some(t => t.includes('새 대화를 열었어요'))).toBe(true)
+  const ev = events(writes).find(x => x.kind === 'new_chat')
+  expect(ev?.ok).toBe(true)
+  expect(ev?.note).toBe(true)
+})
+
+test('when the new chat cannot be opened, says what to send instead', async ($, on) => {
+  const { clock, writes, toasts } = newChatWorld(on, 1)
+  await startAndReply($)
+  await clock.advance(61 * MIN)
+  await pressNewChat($)
+  const toast = toasts.find(t => t.includes('열지 못했어요')) ?? ''
+  expect(toast).toContain('이전 대화를 이어서 해줘')
+  const ev = events(writes).find(x => x.kind === 'new_chat')
+  expect(ev?.ok).toBe(false)
+  expect(String(ev?.why)).toContain('rundll32.exe exit 1')
+})
