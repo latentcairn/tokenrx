@@ -171,8 +171,40 @@ async function measure($: EngineInterface, u: { context: { tokens?: number; wind
   return r
 }
 
+/**
+ * 판단 기록 한 줄을 ~/.claude/tokenrx/mod-events.jsonl에 남긴다. 캐시가 식기 전에 무엇을 했고(살려 두기, 압축, 알림)
+ * 왜 못 했는지(턴이 도는 중, 거절 사유), 타이머가 멈췄는지를 나중에 볼 수 있게 한다. 남기지 못해도 대화에는 영향이 없다.
+ */
+async function logEvent($: EngineInterface, kind: string, detail: Record<string, unknown> = {}) {
+  try {
+    const home = await claudeHome($)
+    if (!home) return
+    const path = `${home}/tokenrx/mod-events.jsonl`
+    let old = ''
+    try {
+      old = await $.fs.read(path)
+    } catch {
+      old = ''
+    }
+    if (old.length > ROTATE_AT) old = old.slice(old.indexOf('\n', old.length / 2) + 1)
+    const line = { ts: Math.round((await $.clock.now()) / 1000), session_id: await $.session.id(), v: version, kind, ...detail }
+    await $.fs.write(path, `${old}${JSON.stringify(line)}\n`)
+  } catch {
+    // 기록은 진단용이다
+  }
+}
+
+const reason = (err: unknown) => String(err instanceof Error ? err.message : err).slice(0, 300)
+
+let version = ''
 let isWorking = false
+let openTurn: string | null = null    // 시작했는데 아직 끝나지 않은 본 대화의 턴
 let warnedFor: number | null = null   // 이 마지막 응답 시각에 대해서는 이미 알렸다(또는 압축했다, 살려 뒀다)
+let blockedFor: number | null = null  // 이 마지막 응답 시각에 대해서는 '건너뜀'을 이미 남겼다
+let ticking = false                   // tick이 도는 중(타이머 두 개가 겹쳐도 한 번만 처리한다)
+let lastTickAt = 0
+let stopTick: (() => void) | null = null
+let stopDue: (() => void) | null = null
 let autoCompact = false
 let keepAliveMs = 0                   // 0이면 끔. 사람이 마지막으로 쓴 뒤 이만큼까지 캐시를 살려 둔다
 let idleSince: number | null = null   // 사람이 쓴 마지막 턴이 끝난 시각(살려 두기 턴은 빼고)
@@ -212,57 +244,130 @@ export function savedOptions(configs: unknown, name: string): Record<string, unk
   return hit ? optionsOf(hit[1]) : undefined
 }
 
-/** 캐시가 식기 전에 압축한다. 압축했으면 true, 못 했으면(진행 중인 턴, 다른 플러그인의 거부, 오류) false. */
-async function compactNow($: EngineInterface) {
+/**
+ * 캐시가 식기 전에 압축한다. 압축했으면 null, 못 했으면 그 까닭(진행 중인 턴, 다른 플러그인의 거부, 오류).
+ * 데스크톱 앱과 SDK에서는 $.session.compact가 늘 거절된다(엔진: "compaction here runs inside a turn (a /compact prompt)").
+ * 그러면 사람이 /compact를 친 것처럼 명령을 넣는다(via 'command').
+ */
+async function compactNow($: EngineInterface): Promise<{ why: string | null; via: 'session' | 'command' }> {
   try {
     const res = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
-    if ('skip' in res && res.skip !== undefined) return false
+    if ('skip' in res && res.skip !== undefined) return { why: `skip: ${reason(res.skip)}`, via: 'session' }
     await update($, lastReplyAt, () => null)   // 압축한 맥락은 다음 응답 때 새로 저장된다
-    return true
+    return { why: null, via: 'session' }
   } catch {
-    return false
+    return { why: await compactByCommand($), via: 'command' }
   }
+}
+
+function wait($: EngineInterface, ms: number) {
+  return new Promise<void>(done => void $.clock.after(ms, done))
+}
+
+/**
+ * /compact를 대화에 넣는다. 압축은 턴 하나로 돌고, 그 턴은 살려 두기 턴처럼 사람이 쓴 것으로 치지 않는다.
+ * 명령이 곧바로 거절되면(이름 없음 등) 그 까닭, 아니면 null. 끝나면 판단 기록에 compact_done이나 compact_failed를 남긴다.
+ */
+async function compactByCommand($: EngineInterface): Promise<string | null> {
+  pinging = true
+  let failed: string | null = null
+  const run = $.command.run({ command: 'compact', args: COMPACT_INSTRUCTIONS }).then(
+    async () => {
+      await update($, lastReplyAt, () => null)
+      const r = await measure($, await $.session.usage())   // 줄어든 크기로 다시 재야 다음 확인이 옛 크기로 또 압축하지 않는다
+      await logEvent($, 'compact_done', { via: 'command', tokens_after: r.tokens ?? null })
+    },
+    async (err: unknown) => {
+      failed = `error: ${reason(err)}`
+      await logEvent($, 'compact_failed', { via: 'command', why: failed })
+    },
+  ).finally(() => {
+    pinging = false
+  })
+  await Promise.race([run, wait($, 2_000)])   // 압축이 끝나기를 기다리지는 않는다. 곧바로 거절됐는지만 본다
+  return failed
 }
 
 /**
  * 캐시가 식기 전에 아주 짧은 턴을 하나 돌려 캐시를 새로 한다. 다시 저장하는 값의 약 40분의 1이다(1시간 캐시).
- * 신호가 들어갔으면 true, 못 들어갔으면(다른 플러그인이 막음, 오류) false.
+ * 신호가 들어갔으면 null, 못 들어갔으면 그 까닭(다른 플러그인이 막음, 오류).
  */
-async function keepAlive($: EngineInterface) {
+async function keepAlive($: EngineInterface): Promise<string | null> {
   pinging = true
   try {
     const res = await $.prompt.submit({ text: pingText() })
     if ('drop' in res) {
       pinging = false
-      return false
+      return `drop: ${reason(res.drop)}`
     }
-    return true
-  } catch {
+    return null
+  } catch (err) {
     pinging = false
-    return false
+    return `error: ${reason(err)}`
   }
 }
 
+/** 30초마다 도는 타이머를 (다시) 켠다. 엔진이 한 주기라도 거절하면 그 타이머는 끝나므로, 멈춘 것을 보면 다시 켠다. */
+function startTicking($: EngineInterface) {
+  stopTick?.()
+  stopTick = $.clock.every(TICK, () => void tick($))
+}
+
+/** 타이머와 따로, 이번 응답의 캐시가 식기 직전에 한 번 더 확인하도록 맞춰 둔다. */
+async function armDue($: EngineInterface, last: number) {
+  stopDue?.()
+  stopDue = null
+  const r = await read($, reading)
+  if (!r?.tokens || r.tokens < BIG) return
+  const wait = last + ttlOf(r) - WARN_BEFORE + 15_000 - (await $.clock.now())
+  if (wait > 0) stopDue = $.clock.after(wait, () => void tick($))
+}
+
 async function tick($: EngineInterface) {
+  if (ticking) return
+  ticking = true
   try {
     const t = await $.clock.now()
+    const gap = lastTickAt ? t - lastTickAt : 0
+    lastTickAt = t
+    if (gap > 5 * TICK) await logEvent($, 'tick_gap', { gap_s: Math.round(gap / 1000) })   // PC가 잠들었거나 타이머가 쉬었다
     await update($, now, () => t)
     const last = await read($, lastReplyAt)
-    if (isWorking || pinging || last === null || warnedFor === last) return
+    if (last === null || warnedFor === last) return
     const r = await read($, reading)
     const text = coolingNotice(r, last, t)
-    if (!text) return
-    warnedFor = last
-    // 1시간 캐시(구독)만 살려 둔다. 5분 캐시는 신호를 너무 자주 보내야 해서 다시 저장하는 편이 싸다
-    if (keepAliveMs && r?.limits.length && t - (idleSince ?? last) < keepAliveMs && (await keepAlive($))) return
-    if (autoCompact && (await compactNow($))) {
-      $.ui.toast(L(`[TokenRx] 캐시가 식기 전에 이 대화(${tokens(r?.tokens ?? 0)} 토큰)를 자동으로 압축했어요. 돌아와서 그대로 이어가도 싸요.`,
-                   `[TokenRx] Compacted this chat (${tokens(r?.tokens ?? 0)} tokens) before its cache cooled. You can pick it up cheaply.`))
+    if (!text || !r) return
+    const facts = { tokens: r.tokens ?? 0, left_s: Math.round((last + ttlOf(r) - t) / 1000),
+                    idle_min: Math.round((t - (idleSince ?? last)) / 60_000) }
+    if (isWorking || pinging) {
+      if (blockedFor !== last) {
+        blockedFor = last
+        await logEvent($, 'skip', { why: isWorking ? 'turn_running' : 'nudge_pending', open_turn: openTurn, ...facts })
+      }
       return
     }
+    warnedFor = last
+    // 1시간 캐시(구독)만 살려 둔다. 5분 캐시는 신호를 너무 자주 보내야 해서 다시 저장하는 편이 싸다
+    if (keepAliveMs && r.limits.length && t - (idleSince ?? last) < keepAliveMs) {
+      const why = await keepAlive($)
+      await logEvent($, 'keepalive', { ok: why === null, ...(why ? { why } : {}), ...facts })
+      if (why === null) return
+    }
+    if (autoCompact) {
+      const { why, via } = await compactNow($)
+      await logEvent($, 'compact', { ok: why === null, via, ...(why ? { why } : {}), ...facts })
+      if (why === null) {
+        $.ui.toast(L(`[TokenRx] 캐시가 식기 전에 이 대화(${tokens(r.tokens ?? 0)} 토큰)를 자동으로 압축했어요. 돌아와서 그대로 이어가도 싸요.`,
+                     `[TokenRx] Compacted this chat (${tokens(r.tokens ?? 0)} tokens) before its cache cooled. You can pick it up cheaply.`))
+        return
+      }
+    }
+    await logEvent($, 'warn', { autoCompact, keepAlive_h: keepAliveMs / 3_600_000, ...facts })
     $.ui.toast(text)
   } catch {
     // 표시용 타이머가 실패해도 대화에는 영향을 주지 않는다
+  } finally {
+    ticking = false
   }
 }
 
@@ -283,6 +388,12 @@ export const register: Register = (on, options) => {
     autoCompact = opts?.autoCompact === 'on'
     keepAliveMs = keepAliveOf(opts?.keepAlive)
     try {
+      version = String($.plugin.root ?? '').split(/[\\/]/).filter(Boolean).pop() ?? ''   // 설치본은 폴더 이름이 버전이다
+    } catch {
+      version = ''
+    }
+    await logEvent($, 'start', { autoCompact, keepAlive: String(opts?.keepAlive ?? 'off'), from_install: opts !== options })
+    try {
       lang = pickLang(opts?.lang, await $.env.get('TOKENRX_LANG'))
       const id = await $.session.id()
       const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>
@@ -297,12 +408,14 @@ export const register: Register = (on, options) => {
     } catch {
       // 처음 여는 대화는 아직 잰 값이 없다
     }
-    $.clock.every(TICK, () => void tick($))
+    startTicking($)
     return result
   })
 
+  // 서브에이전트의 실행은 turn.start를 내지 않는다(엔진 문서). 그래서 여기 오는 것은 본 대화의 턴이다
   on('turn.start', ($, e, next) => {
     isWorking = true
+    openTurn = e.turnId
     if (pinging) {
       pingTurn = e.turnId
       pinging = false
@@ -313,6 +426,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId) return next(e)   // 서브에이전트의 턴은 이 대화의 캐시를 새로 하지 않는다
     isWorking = false
+    openTurn = null
     const wasPing = e.turnId === pingTurn
     pingTurn = null
     try {
@@ -320,6 +434,12 @@ export const register: Register = (on, options) => {
       if (!wasPing) idleSince = t   // 살려 두기 턴은 캐시만 새로 하고, 사람이 쓴 시각은 그대로 둔다
       await update($, lastReplyAt, () => t)
       await update($, now, () => t)
+      if (lastTickAt && t - lastTickAt > 3 * TICK) {   // 타이머가 멈춰 있었다: 남기고 다시 켠다
+        await logEvent($, 'timer_stalled', { stalled_s: Math.round((t - lastTickAt) / 1000) })
+        lastTickAt = t
+        startTicking($)
+      }
+      await armDue($, t)
       const id = await $.session.id()
       const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>
       seen[id] = t

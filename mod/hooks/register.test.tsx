@@ -15,7 +15,8 @@ const LIMITS = [
   { kind: 'seven_day', percentUsed: 13, resetsAt: '2026-10-12T19:00:00Z' },
 ]
 
-function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t' }, settings: Record<string, unknown> = {}) {
+function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t' }, settings: Record<string, unknown> = {},
+               size: () => number = () => 255_186) {
   const clock = mock.clock(on, { now: T0 })
   mock.store(on)
   mock.env(on, env)
@@ -31,7 +32,7 @@ function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERP
   on('session.id', () => ({ value: 's1' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({
-    value: { startedAt: T0, context: { tokens: 255_186, window: 1_000_000, percent: 26 }, rateLimits: LIMITS },
+    value: { startedAt: T0, context: { tokens: size(), window: 1_000_000, percent: 26 }, rateLimits: LIMITS },
   }))
   on('settings.read', () => ({ value: settings }))
   on('fs.read', () => ({ deny: 'missing' }))
@@ -99,15 +100,62 @@ test('records limit changes in the report format, once per change', async ($, on
   const reading = { context: { tokens: 255_186, window: 1_000_000 }, rateLimits: LIMITS, changed: ['rateLimits' as const] }
   await $.session.measure(reading)
   await $.session.measure(reading)
-  expect(writes.length).toBe(1)
-  expect(writes[0]?.path.replace(/\\/g, '/')).toBe('D:/profiles/t/.claude/tokenrx/limits.jsonl')
-  const line = JSON.parse((writes[0]?.text ?? '').trim())
+  const limits = () => writes.filter(w => w.path.endsWith('limits.jsonl'))
+  expect(limits().length).toBe(1)
+  expect(limits()[0]?.path.replace(/\\/g, '/')).toBe('D:/profiles/t/.claude/tokenrx/limits.jsonl')
+  const line = JSON.parse((limits()[0]?.text ?? '').trim())
   expect(line.five_hour.used_percentage).toBe(21)
   expect(line.five_hour.resets_at).toBe(Date.parse('2026-10-11T12:00:00Z') / 1000)
   expect(line.seven_day.used_percentage).toBe(13)
   expect(line.session_id).toBe('s1')
   await $.session.measure({ ...reading, rateLimits: [{ ...LIMITS[0]!, percentUsed: 22 }, LIMITS[1]!] })
-  expect(writes.length).toBe(2)
+  expect(limits().length).toBe(2)
+})
+
+// 판단 기록(~/.claude/tokenrx/mod-events.jsonl)의 줄들
+const events = (writes: { path: string; text: string }[]) =>
+  writes.filter(w => w.path.endsWith('mod-events.jsonl')).map(w => JSON.parse(w.text.trim().split('\n').pop() ?? '{}'))
+
+test('logs why an idle compaction did not happen', { options: { autoCompact: 'on' } }, async ($, on) => {
+  const { clock, writes } = world(on)
+  on('session.compact', () => ({ skip: 'busy' }))
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  const ev = events(writes)
+  expect(ev[0]?.kind).toBe('start')
+  expect(ev[0]?.autoCompact).toBe(true)
+  const compact = ev.find(x => x.kind === 'compact')
+  expect(compact?.ok).toBe(false)
+  expect(compact?.why).toBe('skip: busy')
+  expect(compact?.tokens).toBe(255_186)
+  expect(compact?.session_id).toBe('s1')
+  expect(ev.some(x => x.kind === 'warn')).toBe(true)
+})
+
+test('logs a skip, once, when a turn is still running as the cache is about to cool', { options: { autoCompact: 'on' } }, async ($, on) => {
+  const { clock, writes } = world(on)
+  const compacts: unknown[] = []
+  on('session.compact', ($, e) => {
+    compacts.push(e)
+    return { messages: [], tokensBefore: 1, tokensAfter: 1 }
+  })
+  await startAndReply($)
+  await clock.advance(40 * MIN)
+  await $.turn.start({ text: '', turnId: 't9' })
+  await clock.advance(17 * MIN)
+  expect(compacts.length).toBe(0)
+  const skips = events(writes).filter(x => x.kind === 'skip')
+  expect(skips.length).toBe(1)
+  expect(skips[0]?.why).toBe('turn_running')
+  expect(skips[0]?.open_turn).toBe('t9')
+})
+
+test('logs a successful nudge', { options: { keepAlive: '4h' } }, async ($, on) => {
+  const { clock, writes } = world(on)
+  pings(on)
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  expect(events(writes).filter(x => x.kind === 'keepalive').map(x => x.ok)).toEqual([true])
 })
 
 test('a subagent finishing does not restart the cache timer', async ($, on) => {
@@ -155,6 +203,60 @@ test('with autoCompact on, falls back to the warning when compaction is refused'
   await clock.advance(56 * MIN)
   expect(toasts.length).toBe(1)
   expect(toasts[0]).toContain('/compact')
+})
+
+// 데스크톱 앱(SDK)의 엔진: $.session.compact는 늘 거절하고, /compact 명령은 받아서 턴 하나로 압축한다
+function desktopEngine(on: On, onCompact: () => void = () => {}) {
+  const commands: { command: string; args: string }[] = []
+  on('session.compact', () => {
+    throw new Error('not available in a headless (-p / SDK) session yet: compaction here runs inside a turn (a /compact prompt)')
+  })
+  on('command.run', ($, e) => {
+    commands.push({ command: e.command, args: e.args })
+    onCompact()
+    return { text: '' }
+  })
+  return commands
+}
+
+test('in the desktop app, compacts with the /compact command when the direct call is refused', { options: { autoCompact: 'on' } }, async ($, on) => {
+  let compacted = false
+  const { clock, toasts, writes } = world(on, undefined, {}, () => (compacted ? 20_000 : 255_186))
+  const commands = desktopEngine(on, () => {
+    compacted = true
+  })
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  expect(commands.length).toBe(1)
+  expect(commands[0]?.command).toBe('compact')
+  expect(commands[0]?.args).toContain('files edited')
+  expect(toasts[0]).toContain('자동으로 압축')
+  const ev = events(writes)
+  const compact = ev.find(x => x.kind === 'compact')
+  expect(compact?.ok).toBe(true)
+  expect(compact?.via).toBe('command')
+  expect(ev.find(x => x.kind === 'compact_done')?.tokens_after).toBe(20_000)
+  // 압축 턴 뒤에도 줄어든 대화는 다시 압축하지 않는다
+  await pingTurn($, 1)
+  await clock.advance(3 * 60 * MIN)
+  expect(commands.length).toBe(1)
+})
+
+test('in the desktop app, falls back to the warning when the /compact command is refused too', { options: { autoCompact: 'on' } }, async ($, on) => {
+  const { clock, toasts, writes } = world(on)
+  on('session.compact', () => {
+    throw new Error('not available in a headless (-p / SDK) session yet')
+  })
+  on('command.run', () => {
+    throw new Error('no command named /compact in this session')
+  })
+  await startAndReply($)
+  await clock.advance(56 * MIN)
+  expect(toasts.length).toBe(1)
+  expect(toasts[0]).toContain('/compact')
+  const ev = events(writes)
+  expect(ev.find(x => x.kind === 'compact')?.ok).toBe(false)
+  expect(ev.some(x => x.kind === 'warn')).toBe(true)
 })
 
 // 살려 두기: 엔진이 하는 일(신호가 들어가면 짧은 턴이 돈다)을 손으로 흉내 낸다
@@ -259,7 +361,7 @@ const INSTALLED_ON = { pluginConfigs: { 'tokenrx@latentcairn': { options: { lang
 const ENV = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\profiles\t' }
 
 test('picks up autoCompact saved at install when the app hands the mod over without options', async ($, on) => {
-  const { clock, toasts } = world(on, ENV, INSTALLED_ON)
+  const { clock, toasts, writes } = world(on, ENV, INSTALLED_ON)
   const compacts: (string | undefined)[] = []
   on('session.compact', ($, e) => {
     compacts.push(e.instructions)
@@ -269,6 +371,9 @@ test('picks up autoCompact saved at install when the app hands the mod over with
   await clock.advance(56 * MIN)
   expect(compacts.length).toBe(1)
   expect(toasts[0]).toContain('자동으로 압축')
+  const start = events(writes).find(x => x.kind === 'start')
+  expect(start?.autoCompact).toBe(true)
+  expect(start?.from_install).toBe(true)
 })
 
 test('a value set for the inline copy itself wins over the one saved at install', async ($, on) => {
