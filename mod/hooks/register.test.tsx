@@ -16,7 +16,7 @@ const LIMITS = [
 ]
 
 function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t' }, settings: Record<string, unknown> = {},
-               size: () => number = () => 255_186) {
+               size: () => number = () => 255_186, limits: () => typeof LIMITS = () => LIMITS) {
   const clock = mock.clock(on, { now: T0 })
   mock.store(on)
   mock.env(on, env)
@@ -32,7 +32,7 @@ function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERP
   on('session.id', () => ({ value: 's1' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({
-    value: { startedAt: T0, context: { tokens: size(), window: 1_000_000, percent: 26 }, rateLimits: LIMITS },
+    value: { startedAt: T0, context: { tokens: size(), window: 1_000_000, percent: 26 }, rateLimits: limits() },
   }))
   on('settings.read', () => ({ value: settings }))
   on('fs.read', () => ({ deny: 'missing' }))
@@ -110,6 +110,53 @@ test('records limit changes in the report format, once per change', async ($, on
   expect(line.session_id).toBe('s1')
   await $.session.measure({ ...reading, rateLimits: [{ ...LIMITS[0]!, percentUsed: 22 }, LIMITS[1]!] })
   expect(limits().length).toBe(2)
+})
+
+// 앱을 다시 켜면 mod가 새로 시작하고, 첫 응답 전까지 한도 창이 비어 있다(10/15 앱 업데이트 때 본 일)
+async function restartWithoutLimits($: Engine, ref: { limits: typeof LIMITS }) {
+  await $.session.measure({ context: { tokens: 255_186, window: 1_000_000 }, rateLimits: LIMITS, changed: ['rateLimits' as const] })
+  ref.limits = []
+  await $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+}
+
+test('after the app restarts, a chat on a plan still counts its cache as one hour', async ($, on) => {
+  const ref = { limits: LIMITS }
+  const { clock } = world(on, undefined, undefined, undefined, () => ref.limits)
+  await startAndReply($)
+  await clock.advance(8 * MIN)
+  await restartWithoutLimits($, ref)
+  await clock.advance(2 * MIN)
+  const text = await bandText($)
+  expect(text).toContain('50분 남음')
+  expect(text).not.toContain('캐시가 식었어요')
+})
+
+test('after the app restarts, keepAlive still nudges instead of compacting a warm chat', { options: { keepAlive: '4h', autoCompact: 'on' } }, async ($, on) => {
+  const ref = { limits: LIMITS }
+  const { clock, toasts } = world(on, undefined, undefined, undefined, () => ref.limits)
+  const sent = pings(on)
+  const compacts: unknown[] = []
+  on('session.compact', ($, e) => {
+    compacts.push(e)
+    return { messages: [{ role: 'user' as const, text: '요약', toolUses: [] }], tokensBefore: 255_186, tokensAfter: 20_000 }
+  })
+  await startAndReply($)
+  await clock.advance(1 * MIN)
+  await restartWithoutLimits($, ref)
+  await clock.advance(10 * MIN)
+  expect(compacts.length).toBe(0)
+  expect(toasts.length).toBe(0)
+  await clock.advance(45 * MIN)
+  expect(sent.length).toBe(1)
+  expect(compacts.length).toBe(0)
+})
+
+test('an account that never showed limits keeps the five-minute cache after a restart', async ($, on) => {
+  const { clock } = world(on, undefined, undefined, undefined, () => [])
+  await startAndReply($)
+  await $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+  await clock.advance(2 * MIN)
+  expect(await bandText($)).toContain('3분 남음')
 })
 
 // 판단 기록(~/.claude/tokenrx/mod-events.jsonl)의 줄들

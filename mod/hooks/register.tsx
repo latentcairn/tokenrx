@@ -48,8 +48,10 @@ function cachePrice(model: string) {
   return key === undefined ? undefined : CACHE_PRICES[key]
 }
 
-// 구독 요금제(한도 창이 있는 계정)의 대화 캐시는 1시간, API 키는 5분이다
-const ttlOf = (r: Reading) => (r.limits.length ? 3_600_000 : 300_000)
+// 구독 요금제(한도 창이 있는 계정)의 대화 캐시는 1시간, API 키는 5분이다.
+// 앱을 다시 켠 직후에는 첫 응답 전까지 한도 창이 비어 있어서, 전에 한도를 기록한 적이 있으면 구독으로 본다(hourCache)
+const hourOf = (r: Reading) => r.limits.length > 0 || r.hourCache === true
+const ttlOf = (r: Reading) => (hourOf(r) ? 3_600_000 : 300_000)
 
 const trim = (x: number) => x.toFixed(1).replace(/\.0$/, '')
 const comma = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
@@ -98,7 +100,7 @@ export function bandParts(r: Reading | null, last: number | null, t: number, isW
                    ...(big && left <= WARN_BEFORE ? { color: 'warning' as const } : {}) })
     } else if (big) {
       const p = cachePrice(r.model)
-      const usd = p ? ` (${L('정가 약', 'about')} $${((r.tokens * (p[r.limits.length ? 1 : 0] - p[2])) / 1e6).toFixed(2)})` : ''
+      const usd = p ? ` (${L('정가 약', 'about')} $${((r.tokens * (p[hourOf(r) ? 1 : 0] - p[2])) / 1e6).toFixed(2)})` : ''
       parts.push({ key: 'cache', color: 'warning', newChat: true,
                    text: L(`캐시가 식었어요. 지금 보내면 대화 전체를 다시 저장해요${usd}. 새 대화로 이어가는 게 싸요`,
                            `Cache expired: sending now re-saves the whole chat${usd}. A new chat is cheaper`) })
@@ -167,6 +169,13 @@ async function measure($: EngineInterface, u: { context: { tokens?: number; wind
     window: u.context.window, model,
     limits: u.rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, ...(l.resetsAt ? { resetsAt: l.resetsAt } : {}) })),
     ...(u.context.tokens ? { tokens: u.context.tokens } : {}),
+  }
+  if (!r.limits.length) {
+    try {
+      if (await $.store.get('lastLimits')) r.hourCache = true   // 한도를 기록한 적이 있는 계정이다(recordLimits)
+    } catch {
+      // 모르면 5분 캐시로 본다
+    }
   }
   await update($, reading, () => r)
   return r
@@ -627,7 +636,7 @@ async function tick($: EngineInterface) {
     }
     warnedFor = last
     // 1시간 캐시(구독)만 살려 둔다. 5분 캐시는 신호를 너무 자주 보내야 해서 다시 저장하는 편이 싸다
-    if (keepAliveMs && r.limits.length && t - (idleSince ?? last) < keepAliveMs) {
+    if (keepAliveMs && hourOf(r) && t - (idleSince ?? last) < keepAliveMs) {
       const why = await keepAlive($)
       await logEvent($, 'keepalive', { ok: why === null, ...(why ? { why } : {}), ...facts })
       if (why === null) return
@@ -666,12 +675,21 @@ export const register: Register = (on, options) => {
     }
     autoCompact = opts?.autoCompact === 'on'
     keepAliveMs = keepAliveOf(opts?.keepAlive)
+    let root = ''
     try {
-      version = String($.plugin.root ?? '').split(/[\\/]/).filter(Boolean).pop() ?? ''   // 설치본은 폴더 이름이 버전이다
+      root = String($.plugin.root ?? '')
+      version = root.split(/[\\/]/).filter(Boolean).pop() ?? ''   // 설치본은 폴더 이름이 버전이다
     } catch {
       version = ''
     }
-    await logEvent($, 'start', { autoCompact, keepAlive: String(opts?.keepAlive ?? 'off'), from_install: opts !== options })
+    // 앱이 mod를 어디서 읽는지(설치본인지 작업 폴더인지)와 어떤 이름으로 부르는지도 남긴다
+    let name = ''
+    try {
+      name = String($.plugin.name ?? '')
+    } catch {
+      name = ''
+    }
+    await logEvent($, 'start', { autoCompact, keepAlive: String(opts?.keepAlive ?? 'off'), from_install: opts !== options, name, root })
     try {
       lang = pickLang(opts?.lang, await $.env.get('TOKENRX_LANG'))
       const id = await $.session.id()
