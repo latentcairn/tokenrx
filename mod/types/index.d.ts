@@ -5,6 +5,7 @@ export type Reading = { tokens?: number; window: number; limits: Limit[]; model:
 
 declare module 'claude-code' {
   interface PluginState {
-    tokenrx: { reading: Reading | null; lastReplyAt: number | null; now: number }
+    /** rc: 데스크톱 앱 대화의 원격 제어(Remote Control)가 켜졌는지. 앱 기록을 못 읽으면 null */
+    tokenrx: { reading: Reading | null; lastReplyAt: number | null; now: number; rc: 'on' | 'off' | null }
   }
 }

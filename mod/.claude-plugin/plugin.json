@@ -1,6 +1,6 @@
 {
   "name": "tokenrx",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "TokenRx: shows your usage limits, this chat's size and the minutes left on its prompt cache above the prompt, keeps a long chat's cache warm while you are away (or warns, or compacts) before it cools, offers a one-click handoff to a new chat in the same folder once a long chat's cache has cooled (desktop app), and tidies the desktop chat list (/tokenrx:tidy).",
   "author": {
     "name": "latentcairn"

@@ -16,7 +16,7 @@ const LIMITS = [
 ]
 
 function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t' }, settings: Record<string, unknown> = {},
-               size: () => number = () => 255_186, limits: () => typeof LIMITS = () => LIMITS) {
+               size: () => number = () => 255_186, limits: () => typeof LIMITS = () => LIMITS, files: Record<string, string> = {}) {
   const clock = mock.clock(on, { now: T0 })
   mock.store(on)
   mock.env(on, env)
@@ -35,7 +35,11 @@ function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERP
     value: { startedAt: T0, context: { tokens: size(), window: 1_000_000, percent: 26 }, rateLimits: limits() },
   }))
   on('settings.read', () => ({ value: settings }))
-  on('fs.read', () => ({ deny: 'missing' }))
+  // files: 경로 끝('/'로 쓴다) → 내용. 시험 엔진이 경로를 바꿔 넘기므로 끝만 맞춘다
+  on('fs.read', ($, e) => {
+    const hit = Object.keys(files).find(k => e.path.replace(/\\/g, '/').endsWith(k))
+    return hit === undefined ? { deny: 'missing' } : { value: files[hit] }
+  })
   on('fs.write', ($, e) => {
     writes.push({ path: e.path, text: e.text })
     return { value: undefined }
@@ -539,4 +543,64 @@ test('when the new chat cannot be opened, says what to send instead', async ($, 
   const ev = events(writes).find(x => x.kind === 'new_chat')
   expect(ev?.ok).toBe(false)
   expect(String(ev?.why)).toContain('rundll32.exe exit 1')
+})
+
+// 데스크톱 앱의 원격 제어: 앱은 화면에 없는 쉬는 대화를 멈춘다. 앱이 저장하는 대화 기록(local_*.json)을 읽어 꺼져 있으면 알린다
+const APP_ENV = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t', APPDATA: 'D:\\profiles\\t\\AppData\\Roaming',
+                  CLAUDE_CODE_HOST_SESSION_ID: 'local_abc', CLAUDE_CODE_ACCOUNT_UUID: 'acc', CLAUDE_CODE_ORGANIZATION_UUID: 'org' }
+const APP_CHAT = 'AppData/Roaming/Claude/claude-code-sessions/acc/org/local_abc.json'
+const RC_OFF = { cliSessionId: 's1', remoteControlAutoEligible: false, steeredByRemoteClient: false }
+const RC_NOTICE = '원격 제어를 켜야'
+
+function rcWorld(on: On, meta: unknown, size: () => number = () => 255_186) {
+  const files: Record<string, string> = meta === undefined ? {} : { [APP_CHAT]: JSON.stringify(meta) }
+  return { ...world(on, APP_ENV, {}, size, () => LIMITS, files), files }
+}
+
+test('in the desktop app, a long chat with Remote Control off says to turn it on, on desktop only', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const { clock, writes } = rcWorld(on, RC_OFF)
+  await startAndReply($)
+  await clock.advance(5 * MIN)
+  expect(await bandText($, 'desktop')).toContain(RC_NOTICE)
+  expect(await bandText($, 'terminal')).not.toContain(RC_NOTICE)
+  expect(events(writes).filter(x => x.kind === 'rc').map(x => x.state)).toEqual(['off'])
+})
+
+test('the Remote Control notice goes away once it is turned on, without a new turn', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const { clock, writes, files } = rcWorld(on, RC_OFF)
+  await startAndReply($)
+  expect(await bandText($)).toContain(RC_NOTICE)
+  files[APP_CHAT] = JSON.stringify({ ...RC_OFF, remoteControlUserEnabled: true, bridgeSessionIds: ['session_1'] })
+  await clock.advance(6 * MIN)
+  expect(await bandText($)).not.toContain(RC_NOTICE)
+  expect(events(writes).filter(x => x.kind === 'rc').map(x => x.state)).toEqual(['off', 'on'])
+})
+
+test('a chat the app connected to Remote Control by itself gets no notice', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const { clock } = rcWorld(on, { cliSessionId: 's1', remoteControlAutoEligible: true, bridgeSessionIds: ['session_1'] })
+  await startAndReply($)
+  await clock.advance(5 * MIN)
+  expect(await bandText($)).not.toContain(RC_NOTICE)
+})
+
+test('no Remote Control notice when the app record cannot be read', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const { clock, writes } = rcWorld(on, undefined)
+  await startAndReply($)
+  await clock.advance(5 * MIN)
+  expect(await bandText($)).not.toContain(RC_NOTICE)
+  expect(events(writes).some(x => x.kind === 'rc')).toBe(false)
+})
+
+test('no Remote Control notice for a short chat', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const { clock } = rcWorld(on, RC_OFF, () => 50_000)
+  await startAndReply($)
+  await clock.advance(5 * MIN)
+  expect(await bandText($)).not.toContain(RC_NOTICE)
+})
+
+test('no Remote Control notice when keepAlive and autoCompact are both off', async ($, on) => {
+  const { clock } = rcWorld(on, RC_OFF)
+  await startAndReply($)
+  await clock.advance(5 * MIN)
+  expect(await bandText($)).not.toContain(RC_NOTICE)
 })

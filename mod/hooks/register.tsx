@@ -9,12 +9,14 @@ import type { Limit, Reading } from '../types'
 const reading = atom({ plugin: 'tokenrx', key: 'reading' } as const, null)
 const lastReplyAt = atom({ plugin: 'tokenrx', key: 'lastReplyAt' } as const, null)
 const now = atom({ plugin: 'tokenrx', key: 'now' } as const, 0)
+const rc = atom({ plugin: 'tokenrx', key: 'rc' } as const, null)
 
 const BIG = 100_000              // 이보다 짧은 대화는 캐시가 식어도 다시 저장하는 부담이 작다(idle_guard.py와 같은 값)
 const WARN_BEFORE = 5 * 60_000   // 캐시가 식기 이만큼 전에 한 번 알린다
 const TICK = 30_000              // 남은 시간을 고쳐 그리는 간격
 const KEEP = 50                  // 마지막 응답 시각을 기억해 두는 대화 수
 const ROTATE_AT = 2_000_000      // 기록 파일이 이보다 크면 앞쪽 절반을 버린다($.fs.read는 4MiB까지만 읽는다)
+const RC_EVERY = 5 * 60_000      // 원격 제어가 켜졌는지 다시 읽는 간격(앱의 대화 기록 파일이 약 0.5MB라 자주 읽지 않는다)
 
 // 1M 토큰당 캐시 저장(5분), 캐시 저장(1시간), 캐시 읽기 가격(USD). hooks/idle_guard.py의 표와 같다.
 const CACHE_PRICES: Record<string, readonly [number, number, number]> = {
@@ -25,7 +27,7 @@ const CACHE_PRICES: Record<string, readonly [number, number, number]> = {
 }
 
 // newChat: 캐시가 식은 긴 대화. 데스크톱 앱에서는 옆에 '새 대화로 이어가기' 버튼을 단다
-export type Part = { key: 'limits' | 'context' | 'cache'; text: string; color?: 'warning' | 'error'; newChat?: true }
+export type Part = { key: 'limits' | 'context' | 'cache' | 'rc'; text: string; color?: 'warning' | 'error'; newChat?: true }
 
 let lang: 'ko' | 'en' = 'en'
 const L = (ko: string, en: string) => (lang === 'ko' ? ko : en)
@@ -74,7 +76,8 @@ function clock(iso: string, ref: number) {
 const NAMES: Record<string, [string, string]> = { five_hour: ['5시간', '5h'], seven_day: ['주간', 'week'] }
 
 /** 입력창 위 한 줄에 들어갈 조각들. 보여 줄 것이 없으면 빈 배열. */
-export function bandParts(r: Reading | null, last: number | null, t: number, isWorking: boolean): Part[] {
+// rcOff: 데스크톱 앱에서 원격 제어가 꺼진 대화. 앱이 화면에 없는 쉬는 대화를 1~2분 뒤 멈추므로 살려 두기·자리 비움 압축이 돌 수 없다
+export function bandParts(r: Reading | null, last: number | null, t: number, isWorking: boolean, rcOff = false): Part[] {
   if (!r) return []
   const parts: Part[] = []
   const windows = r.limits.filter(l => NAMES[l.kind])
@@ -98,6 +101,10 @@ export function bandParts(r: Reading | null, last: number | null, t: number, isW
     if (left > 0) {
       parts.push({ key: 'cache', text: `${L('캐시', 'cache')} ${minutes(left)} ${L('남음', 'left')}`,
                    ...(big && left <= WARN_BEFORE ? { color: 'warning' as const } : {}) })
+      if (big && rcOff) {
+        parts.push({ key: 'rc', color: 'warning',
+                     text: L('원격 제어를 켜야 다른 대화로 옮겨도 안 식어요', 'turn on Remote Control so this chat stays warm when you switch away') })
+      }
     } else if (big) {
       const p = cachePrice(r.model)
       const usd = p ? ` (${L('정가 약', 'about')} $${((r.tokens * (p[hourOf(r) ? 1 : 0] - p[2])) / 1e6).toFixed(2)})` : ''
@@ -201,6 +208,58 @@ async function logEvent($: EngineInterface, kind: string, detail: Record<string,
     await $.fs.write(path, `${old}${JSON.stringify(line)}\n`)
   } catch {
     // 기록은 진단용이다
+  }
+}
+
+/**
+ * 데스크톱 앱(2.37337.1~)은 화면에 없는 쉬는 대화의 엔진을 1~2분 뒤 멈춘다(앱 `pauseSession(…, "idle_timeout")`). 그러면 이 mod도
+ * 같이 멈춰 살려 두기가 돌지 않는다. 원격 제어(Remote Control)가 켜진 대화는 멈추지 않는다. 앱이 저장하는 대화 기록(local_*.json)의
+ * 원격 제어 칸으로 켜졌는지 본다. 사람이 켜고 끈 값이 먼저이고, 없으면 앱 설정으로 자동 연결된 대화(연결 기록이 있음)를 켜진 것으로 본다.
+ * 모르는 모양이면 undefined(아무것도 띄우지 않는다).
+ */
+export function remoteControlOf(meta: unknown): 'on' | 'off' | undefined {
+  if (!meta || typeof meta !== 'object') return undefined
+  const m = meta as Record<string, unknown>
+  if (m.remoteControlUserEnabled === true) return 'on'
+  if (m.remoteControlUserEnabled === false) return 'off'
+  if (!('remoteControlAutoEligible' in m)) return undefined
+  const bridged = Array.isArray(m.bridgeSessionIds) && m.bridgeSessionIds.length > 0
+  return m.remoteControlAutoEligible === true && bridged ? 'on' : 'off'
+}
+
+/** 앱이 이 대화를 저장하는 파일. 데스크톱 앱이 엔진에 넘기는 환경 변수로 찾는다(터미널에서는 없다). */
+async function appChatFile($: EngineInterface) {
+  const host = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
+  const account = await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')
+  const org = await $.env.get('CLAUDE_CODE_ORGANIZATION_UUID')
+  const appdata = await $.env.get('APPDATA')
+  if (!host || !account || !org || !appdata || !/^local_[\w-]+$/.test(host)) return undefined
+  return `${appdata.replace(/[\\/]+$/, '')}/Claude/claude-code-sessions/${account}/${org}/${host}.json`
+}
+
+let rcCheckedAt = 0
+let rcLogged: 'on' | 'off' | null = null
+
+/** 원격 제어 상태를 다시 읽는다(force가 아니면 RC_EVERY마다). 실패해도 던지지 않는다: 살려 두기 타이머 안에서도 불린다. */
+async function checkRemoteControl($: EngineInterface, force: boolean) {
+  try {
+    const t = await $.clock.now()
+    if (!force && t - rcCheckedAt < RC_EVERY) return
+    rcCheckedAt = t
+    let state: 'on' | 'off' | undefined
+    try {
+      const path = await appChatFile($)
+      if (path) state = remoteControlOf(JSON.parse(await $.fs.read(path)))
+    } catch {
+      state = undefined   // 앱 기록을 못 읽으면 모른다고 보고 아무것도 띄우지 않는다
+    }
+    await update($, rc, () => state ?? null)
+    if (state && state !== rcLogged) {
+      rcLogged = state
+      await logEvent($, 'rc', { state })
+    }
+  } catch {
+    // 원격 제어 안내는 덤이다
   }
 }
 
@@ -620,6 +679,7 @@ async function tick($: EngineInterface) {
     lastTickAt = t
     if (gap > 5 * TICK) await logEvent($, 'tick_gap', { gap_s: Math.round(gap / 1000) })   // PC가 잠들었거나 타이머가 쉬었다
     await update($, now, () => t)
+    await checkRemoteControl($, false)   // 사람이 원격 제어 스위치를 켜고 끄는 것은 턴을 내지 않는다
     const last = await read($, lastReplyAt)
     if (last === null || warnedFor === last) return
     const r = await read($, reading)
@@ -705,6 +765,7 @@ export const register: Register = (on, options) => {
     } catch {
       // 처음 여는 대화는 아직 잰 값이 없다
     }
+    await checkRemoteControl($, true)
     startTicking($)
     return result
   })
@@ -737,6 +798,7 @@ export const register: Register = (on, options) => {
         startTicking($)
       }
       await armDue($, t)
+      await checkRemoteControl($, true)
       const id = await $.session.id()
       const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>
       seen[id] = t
@@ -762,7 +824,9 @@ export const register: Register = (on, options) => {
     if (e.props.hasSurvey) return next(e)
     const last = await read($, lastReplyAt)
     const t = Math.max(await read($, now), last ?? 0)
-    const parts = bandParts(await read($, reading), last, t, e.props.isWorking)
+    // 원격 제어 안내는 데스크톱 앱에서, 살려 두기나 자리 비움 압축을 켰을 때만(둘 다 엔진이 살아 있어야 돈다)
+    const rcOff = e.surface === 'desktop' && (keepAliveMs > 0 || autoCompact) && (await read($, rc)) === 'off'
+    const parts = bandParts(await read($, reading), last, t, e.props.isWorking, rcOff)
     if (!parts.length) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
     // claude://로 새 대화를 여는 것은 데스크톱 앱뿐이다
