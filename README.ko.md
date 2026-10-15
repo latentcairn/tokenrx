@@ -2,7 +2,31 @@
 
 [English](README.md) | 한국어
 
-Claude Code와 Codex의 사용 기록을 읽어 **토큰과 사용 한도가 어디로 샜는지** 진단하고, 설정을 고쳐 주는 도구예요. 함께 들어 있는 [Claude Code mod](#tokenrx-mod)는 작업하는 동안 한도와 캐시 남은 시간을 보여 주고, 자리를 비운 사이 긴 대화의 캐시가 식지 않게 지켜요.
+**Claude Code의 긴 대화를 한 시간 넘게 두면 캐시가 식어요. 그 뒤 메시지를 하나 보내면 대화 전체를 비싼 값에 다시 저장해요.** 20만 토큰짜리 Opus 5.5 대화라면 API 정가로 약 $1.56이에요. 실제 사용 기록으로 시험해 보니, 이렇게 다시 저장하는 비용이 **Claude Code 사용량의 40%가 넘었어요.** 그런데 어떤 사용량 표시도 이걸 보여 주지 않았어요.
+
+TokenRx는 이런 낭비를 찾아내고, 그중 가장 큰 것은 작업하는 동안 막아 줘요.
+
+- **[mod](#tokenrx-mod)**: 터미널과 Claude 데스크톱 앱에서, 입력창 위에 한도와 캐시 남은 시간을 보여 줘요. 자리를 비운 사이에는 한 줄짜리 메시지로 긴 대화의 캐시를 이어 줘요. Opus 5.5 기준으로 다시 저장하는 비용의 약 1/40이에요. 실제로 하룻밤(9시간, 긴 대화 7개) 동안 44번 보냈는데, 모두 캐시가 식기 약 5분 전에 갔고 실패는 없었어요.
+- **진단서**: Claude Code와 Codex의 사용 기록을 읽어 **토큰과 사용 한도가 어디로 샜는지** 보여 줘요. **처방**은 낭비를 만드는 설정을 고치고, `undo`로 원래대로 되돌릴 수 있어요.
+
+```
+TokenRx · 5시간 18% · 주간 35% · 이 대화 21.2만 토큰 · 캐시 41분 남음
+```
+
+**mod 써 보기:**
+
+```
+claude plugin marketplace add latentcairn/tokenrx
+claude plugin install tokenrx@latentcairn
+```
+
+살려 두기는 처음엔 꺼져 있어요. 켜려면 `~/.claude/settings.json`에 아래를 넣으세요. Claude 구독이 있어야 하고, 데스크톱 앱에서는 긴 대화의 원격 제어(Remote Control)도 켜야 해요([이유](#tokenrx-mod)).
+
+```json
+"pluginConfigs": {
+  "tokenrx@latentcairn": { "options": { "keepAlive": "12h" } }
+}
+```
 
 ![예시 진단서(가짜 데이터)](docs/sample-report.png)
 

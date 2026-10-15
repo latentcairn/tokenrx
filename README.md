@@ -2,7 +2,31 @@
 
 English | [한국어](README.ko.md)
 
-TokenRx reads your local Claude Code and Codex logs and tells you **where your tokens and usage limits went**. It can then fix the settings that cause the waste. A [Claude Code mod](#the-tokenrx-mod) also shows your limits and the prompt cache as you work, and keeps long chats warm while you're away.
+**Leave a long Claude Code chat for an hour and its prompt cache expires. Your next message then re-saves the whole chat at the cache-write price.** For a 200K-token Opus 5.5 chat that's about $1.56 at API prices. On real-world logs we tested, these rebuilds were **over 40% of Claude Code usage**, and no usage meter showed them.
+
+TokenRx finds this leak and the others, and stops the biggest one while you work:
+
+- **The [mod](#the-tokenrx-mod)** shows your limits and the minutes left on the cache above the prompt, in the terminal and the Claude desktop app. While you're away, it keeps long chats warm with a one-line nudge that costs about 1/40 of re-saving the chat on Opus 5.5. In one night of real use (9 hours, 7 long chats) it sent 44 nudges, each about five minutes before the cache would have expired, and none failed.
+- **The report** reads your local Claude Code and Codex logs and shows **where your tokens and usage limits went**. **Prescriptions** fix the settings that waste them, and `undo` puts the originals back.
+
+```
+TokenRx · 5h 18% · week 35% · this chat 212K tokens · cache 41 min left
+```
+
+**Try the mod:**
+
+```
+claude plugin marketplace add latentcairn/tokenrx
+claude plugin install tokenrx@latentcairn
+```
+
+Keep-alive is off by default. To turn it on, add this to `~/.claude/settings.json` (it needs a Claude subscription; in the desktop app, also turn on Remote Control for long chats, [see why](#the-tokenrx-mod)):
+
+```json
+"pluginConfigs": {
+  "tokenrx@latentcairn": { "options": { "keepAlive": "12h" } }
+}
+```
 
 ![Sample report (synthetic data)](docs/sample-report-en.png)
 
