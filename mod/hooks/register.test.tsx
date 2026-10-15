@@ -15,9 +15,53 @@ const LIMITS = [
   { kind: 'seven_day', percentUsed: 13, resetsAt: '2026-10-12T19:00:00Z' },
 ]
 
+// 파일 내용이 이것으로 시작하면 그 읽기는 한 번 답하지 않는다(엔진이 답하지 않는 호출에 걸린 tick을 흉내 낸다)
+const HANG = '\u0000hang'
+
+// 엔진이 타이머를 취소하는 것을 흉내 낼 수 있는 시계(mock.clock은 잠을 거절하게 할 수 없다)
+function fakeClock(on: On, start: number) {
+  let t = start
+  let refuse = 0
+  const waits: { due: number; done: (v: unknown) => void }[] = []
+  const wait = (ms: number) => {
+    if (refuse > 0) {
+      refuse -= 1
+      return { deny: 'cancelled' }
+    }
+    return new Promise(done => waits.push({ due: t + ms, done }))
+  }
+  on('clock.now', () => ({ value: t }))
+  on('clock.sleep', ($, e) => wait(e.ms))
+  on('clock.after', ($, e) => wait(e.ms))
+  on('clock.every', ($, e) => wait(e.ms))
+  const settle = async () => {
+    for (let i = 0; i < 300; i++) await Promise.resolve()
+  }
+  return {
+    refuse: (n: number) => {
+      refuse = n
+    },
+    async advance(ms: number) {
+      const end = t + ms
+      for (;;) {
+        await settle()
+        waits.sort((a, b) => a.due - b.due)
+        const next = waits[0]
+        if (!next || next.due > end) break
+        waits.shift()
+        t = next.due
+        next.done({ value: undefined })
+      }
+      t = end
+      await settle()
+    },
+  }
+}
+
 function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERPROFILE: 'D:\\profiles\\t' }, settings: Record<string, unknown> = {},
-               size: () => number = () => 255_186, limits: () => typeof LIMITS = () => LIMITS, files: Record<string, string> = {}) {
-  const clock = mock.clock(on, { now: T0 })
+               size: () => number = () => 255_186, limits: () => typeof LIMITS = () => LIMITS, files: Record<string, string> = {},
+               clockOf: (on: On) => { advance(ms: number): Promise<unknown> } = o => mock.clock(o, { now: T0 })) {
+  const clock = clockOf(on)
   mock.store(on)
   mock.env(on, env)
   const writes: { path: string; text: string }[] = []
@@ -38,7 +82,10 @@ function world(on: On, env: Record<string, string> = { TOKENRX_LANG: 'ko', USERP
   // files: 경로 끝('/'로 쓴다) → 내용. 시험 엔진이 경로를 바꿔 넘기므로 끝만 맞춘다
   on('fs.read', ($, e) => {
     const hit = Object.keys(files).find(k => e.path.replace(/\\/g, '/').endsWith(k))
-    return hit === undefined ? { deny: 'missing' } : { value: files[hit] }
+    if (hit === undefined) return { deny: 'missing' }
+    if (!files[hit].startsWith(HANG)) return { value: files[hit] }
+    files[hit] = files[hit].slice(HANG.length)
+    return new Promise(() => {})
   })
   on('fs.write', ($, e) => {
     writes.push({ path: e.path, text: e.text })
@@ -603,4 +650,94 @@ test('no Remote Control notice when keepAlive and autoCompact are both off', asy
   await startAndReply($)
   await clock.advance(5 * MIN)
   expect(await bandText($)).not.toContain(RC_NOTICE)
+})
+
+// mod를 다시 읽은 뒤에도 살려 두기가 이어져야 한다(10/15 한 대화: 일하던 엔진이 턴 끝에 mod를 다시 읽은 뒤 박동이 멈췄다)
+test('keeps the keep-alive going when the engine cancels its timer once', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const clock = fakeClock(on, T0)   // world가 mock.clock 대신 이 시계를 쓴다
+  const { writes } = world(on, undefined, undefined, undefined, undefined, undefined, () => clock)
+  const sent = pings(on)
+  await startAndReply($)
+  clock.refuse(1)
+  await clock.advance(56 * MIN)
+  expect(sent.length).toBe(1)
+  expect(events(writes).some(x => x.kind === 'timer_error')).toBe(true)
+})
+
+test('a mod reloaded without session.start starts at its next turn and keeps the chat warm', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const { clock, writes } = world(on)
+  const sent = pings(on)
+  await $.turn.start({ text: '이어서 해줘', turnId: 't1' })
+  await $.turn.complete({ answer: '끝냈어요', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.advance(56 * MIN)
+  expect(sent.length).toBe(1)
+  expect(events(writes).find(x => x.kind === 'start')?.via).toBe('turn.start')
+})
+
+test('a tick stuck on a call the engine never answers does not stop the keep-alive', { options: { keepAlive: '12h' } }, async ($, on) => {
+  const { clock, writes, files } = rcWorld(on, { ...RC_OFF, remoteControlUserEnabled: true })
+  const sent = pings(on)
+  await startAndReply($)
+  files[APP_CHAT] = HANG + files[APP_CHAT]   // 5분 뒤 tick이 원격 제어를 다시 읽다가 걸린다
+  await clock.advance(56 * MIN)
+  expect(sent.length).toBe(1)
+  expect(events(writes).some(x => x.kind === 'tick_stuck')).toBe(true)
+})
+
+test('logs the first tick after the mod starts, so a dead timer shows in the log', async ($, on) => {
+  const { clock, writes } = world(on)
+  await startAndReply($)
+  await clock.advance(1 * MIN)
+  const first = events(writes).filter(x => x.kind === 'tick_first')
+  expect(first.length).toBe(1)
+  expect(first[0].after_s).toBe(30)
+})
+
+test('a chat with no reply time of its own saved takes it from when its transcript was last written', async ($, on) => {
+  const { clock } = world(on)
+  on('session.root', () => ({ value: 'C:/work' }))
+  on('fs.list', () => ({ value: [
+    { name: 'other.jsonl', kind: 'file' as const, size: 10, mtimeMs: T0 + 19 * MIN, isLink: false },
+    { name: 's1.jsonl', kind: 'file' as const, size: 10, mtimeMs: T0 + 10 * MIN, isLink: false },
+  ] }))
+  await clock.advance(20 * MIN)
+  await $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+  expect(await bandText($)).toContain('50분 남음')
+})
+
+// $.clock.after는 함수가 아니라 { cancel }을 돌려준다(10/15 실제 엔진: 큰 대화의 두 번째 턴 끝마다 'stopDue is not a function'.
+// 0.3.6~0.3.9에선 이 오류가 턴 끝의 남은 일, 곧 응답 시각 저장과 원격 제어 확인까지 건너뛰게 했다)
+test('a big chat that answers twice re-arms its cooling check without an error', async ($, on) => {
+  const { clock, writes } = world(on)
+  await startAndReply($)
+  await clock.advance(10 * MIN)
+  await $.turn.start({ text: '하나 더', turnId: 't2' })
+  await $.turn.complete({ answer: '했어요', durationMs: 1000, isAborted: false, turnId: 't2', reason: 'answer' })
+  await clock.advance(1 * MIN)
+  expect(events(writes).filter(x => x.kind === 'error')).toEqual([])
+})
+
+// 일하던 엔진이 턴 끝에 mod를 다시 읽으면 session.start와 turn.complete가 겹쳐 온다(10/15 실제 기록: 시작과 같은 초에 timer_stalled).
+// turn.complete는 시작 준비가 끝나기를 기다려야, 옛 응답 시각이 이번 응답 시각을 덮지 않는다.
+// 시험 엔진은 훅을 하나씩 돌려 실제처럼 겹치지는 않는다. 그래서 이 시험은 고치기 전 코드에서도 통과한다: 결과만 지킨다
+test('a mod reloaded at the end of a turn finishes starting before it handles that turn', async ($, on) => {
+  const { clock, writes } = world(on)
+  on('session.root', () => ({ value: 'C:/work' }))
+  let release = () => {}
+  const listed = new Promise<void>(done => { release = done })
+  // 시작 준비가 대화 기록 폴더를 읽는 동안 턴 끝이 들어온다
+  on('fs.list', async () => {
+    await listed
+    return { value: [{ name: 's1.jsonl', kind: 'file' as const, size: 10, mtimeMs: T0, isLink: false }] }
+  })
+  await clock.advance(30 * MIN)
+  const starting = $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 50; i++) await Promise.resolve()
+  const ending = $.turn.complete({ answer: '끝냈어요', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer' })
+  for (let i = 0; i < 50; i++) await Promise.resolve()
+  release()
+  await Promise.all([starting, ending])
+  await clock.advance(1 * MIN)
+  expect(events(writes).filter(x => x.kind === 'timer_stalled' || x.kind === 'error')).toEqual([])
+  expect(await bandText($)).toContain('59분 남음')
 })

@@ -271,9 +271,17 @@ let openTurn: string | null = null    // 시작했는데 아직 끝나지 않은
 let warnedFor: number | null = null   // 이 마지막 응답 시각에 대해서는 이미 알렸다(또는 압축했다, 살려 뒀다)
 let blockedFor: number | null = null  // 이 마지막 응답 시각에 대해서는 '건너뜀'을 이미 남겼다
 let ticking = false                   // tick이 도는 중(타이머 두 개가 겹쳐도 한 번만 처리한다)
+let tickingSince = 0                  // 지금 도는 tick이 시작한 시각. 너무 오래면 걸린 것으로 보고 넘어간다
 let lastTickAt = 0
-let stopTick: (() => void) | null = null
-let stopDue: (() => void) | null = null
+let beatGen = 0                       // 박동 고리의 세대. 새로 켜면 옛 고리는 다음 바퀴에서 멈춘다
+let beatAlive = false                 // 지금 도는 박동 고리가 있다
+let beatStartedAt = 0                 // 박동을 켠 시각. 한 번도 돌지 않은 박동을 알아보는 데 쓴다
+let firstTickLogged = false
+let stopDue: { cancel(): void } | null = null   // $.clock.after가 돌려주는 것. 함수가 아니다
+// 이 mod 인스턴스의 시작 준비(설정·저장값·크기 읽기, 박동). 턴 끝에 다시 읽힌 mod에는 session.start와 turn.complete가
+// 겹쳐 온다(10/15 실제 기록). 그래서 다른 훅은 이것이 끝나기를 기다린 뒤 움직인다
+let ready: Promise<void> | null = null
+const loggedErrors = new Set<string>()
 let autoCompact = false
 let keepAliveMs = 0                   // 0이면 끔. 사람이 마지막으로 쓴 뒤 이만큼까지 캐시를 살려 둔다
 let idleSince: number | null = null   // 사람이 쓴 마지막 턴이 끝난 시각(살려 두기 턴은 빼고)
@@ -654,15 +662,65 @@ async function continueInNewChat($: EngineInterface) {
   }
 }
 
-/** 30초마다 도는 타이머를 (다시) 켠다. 엔진이 한 주기라도 거절하면 그 타이머는 끝나므로, 멈춘 것을 보면 다시 켠다. */
-function startTicking($: EngineInterface) {
-  stopTick?.()
-  stopTick = $.clock.every(TICK, () => void tick($))
+/** 같은 곳의 실패는 이 인스턴스에서 한 번만 남긴다. */
+async function logError($: EngineInterface, where: string, err: unknown) {
+  if (loggedErrors.has(where)) return
+  loggedErrors.add(where)
+  await logEvent($, 'error', { where, err: reason(err) })
+}
+
+/**
+ * 30초마다 tick을 부르는 박동. $.clock.every는 엔진이 한 주기라도 거절하거나 mod를 다시 읽으며 취소하면 아무 말 없이 끝난다
+ * (10/15 한 대화: 일하던 중에 mod 파일이 바뀌어 턴이 끝나자마자 다시 읽힌 뒤 살려 두기가 멈췄다). 그래서 $.clock.sleep을
+ * 되풀이한다. 잠이 취소되면 그것을 알고 다시 잠든다. 연달아 세 번 실패하면(엔진이 이 mod를 내렸다) 멈추고 남긴다.
+ */
+async function heartbeat($: EngineInterface, gen: number) {
+  let fails = 0
+  while (gen === beatGen) {
+    try {
+      await $.clock.sleep(TICK)
+      fails = 0
+    } catch (err) {
+      fails += 1
+      if (fails === 1) await logEvent($, 'timer_error', { err: reason(err) })
+      if (fails < 3) continue
+      if (gen === beatGen) beatAlive = false
+      await logEvent($, 'timer_stopped', { err: reason(err) })
+      return
+    }
+    if (gen !== beatGen) return
+    try {
+      await tick($)
+    } catch {
+      // tick은 던지지 않지만, 던져도 박동은 이어 간다
+    }
+  }
+}
+
+/** 박동을 (다시) 켠다. 옛 고리는 다음 바퀴에서 스스로 멈춘다. 던지지 않는다. */
+async function startTicking($: EngineInterface) {
+  beatGen += 1
+  beatAlive = true
+  try {
+    beatStartedAt = await $.clock.now()
+  } catch {
+    beatStartedAt = 0
+  }
+  void heartbeat($, beatGen)
+}
+
+/** 박동이 멈췄거나 한 번도 돌지 않았으면 남기고 다시 켠다. 턴이 시작하고 끝날 때 부른다. */
+async function reviveTicking($: EngineInterface, t: number) {
+  const ref = lastTickAt || beatStartedAt
+  if (beatAlive && ref && t - ref <= 3 * TICK) return
+  await logEvent($, 'timer_stalled', { stalled_s: ref ? Math.round((t - ref) / 1000) : null, never_ticked: !lastTickAt })
+  lastTickAt = 0
+  await startTicking($)
 }
 
 /** 타이머와 따로, 이번 응답의 캐시가 식기 직전에 한 번 더 확인하도록 맞춰 둔다. */
 async function armDue($: EngineInterface, last: number) {
-  stopDue?.()
+  stopDue?.cancel()
   stopDue = null
   const r = await read($, reading)
   if (!r?.tokens || r.tokens < BIG) return
@@ -671,11 +729,25 @@ async function armDue($: EngineInterface, last: number) {
 }
 
 async function tick($: EngineInterface) {
-  if (ticking) return
-  ticking = true
+  let t: number
   try {
-    const t = await $.clock.now()
+    t = await $.clock.now()
+  } catch {
+    return
+  }
+  if (ticking) {
+    if (t - tickingSince < 4 * TICK) return
+    // 앞선 tick이 2분 넘게 끝나지 않았다(엔진이 답하지 않는 호출에 걸림). 그것을 기다리지 않고 넘어간다
+    await logEvent($, 'tick_stuck', { stuck_s: Math.round((t - tickingSince) / 1000) })
+  }
+  ticking = true
+  tickingSince = t
+  try {
     const gap = lastTickAt ? t - lastTickAt : 0
+    if (!firstTickLogged) {   // mod가 (다시) 시작한 뒤 박동이 실제로 도는지 판단 기록으로 확인할 수 있게 한 번 남긴다
+      firstTickLogged = true
+      await logEvent($, 'tick_first', { after_s: beatStartedAt ? Math.round((t - beatStartedAt) / 1000) : null })
+    }
     lastTickAt = t
     if (gap > 5 * TICK) await logEvent($, 'tick_gap', { gap_s: Math.round(gap / 1000) })   // PC가 잠들었거나 타이머가 쉬었다
     await update($, now, () => t)
@@ -715,8 +787,114 @@ async function tick($: EngineInterface) {
   } catch {
     // 표시용 타이머가 실패해도 대화에는 영향을 주지 않는다
   } finally {
-    ticking = false
+    if (tickingSince === t) ticking = false   // 걸린 tick을 넘어간 뒤에 그것이 늦게 끝나도 지금 도는 tick의 표시를 지우지 않는다
   }
+}
+
+// 대화마다 마지막 응답 시각을 따로 둔다. 0.3.9까지는 한 칸에 모아 읽고 고쳐 썼는데, 엔진 여럿이 같은 칸을 고쳐 쓰면 서로 덮어썼다
+const REPLY_KEY = 'lastReplyAt:'
+
+/** 이 대화의 기록 파일을 마지막으로 쓴 시각(ms). 엔진은 응답마다 이 파일에 덧붙이므로 마지막 응답 시각과 거의 같다. 모르면 undefined. */
+async function transcriptWrittenAt($: EngineInterface, id: string) {
+  const home = await claudeHome($)
+  if (!home) return undefined
+  const folder = await $.session.root()
+  const dir = native(`${home}/projects/${folder.replace(/[^a-zA-Z0-9]/g, '-')}`)
+  return (await $.fs.list(dir)).find(e => e.kind === 'file' && e.name === `${id}.jsonl`)?.mtimeMs
+}
+
+/**
+ * 다시 시작한 mod가 쓸 마지막 응답 시각. 대화별 칸이 있으면 그것을 믿는다. 없으면 0.3.9까지의 모음 값인데, 그 값은 엔진끼리
+ * 덮어써 몇 시간씩 낡아 있었다(10/15: 18:30에 응답한 대화가 16:35로 남아 캐시가 이미 식은 줄 알았다). 그래서 기록 파일을
+ * 마지막으로 쓴 시각과 견주어 늦은 쪽을 쓴다. 지금 들고 있는 값보다 이르게 되돌리지는 않는다.
+ */
+async function savedReplyAt($: EngineInterface, id: string) {
+  const own = await $.store.get(REPLY_KEY + id)
+  let at = typeof own === 'number' ? own : undefined
+  if (at === undefined) {
+    const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>   // 0.3.9까지의 모음
+    at = typeof seen[id] === 'number' ? seen[id] : undefined
+    try {
+      const written = await transcriptWrittenAt($, id)
+      if (written !== undefined && (at === undefined || written > at)) at = written
+    } catch {
+      // 기록 파일을 못 찾으면 저장값대로
+    }
+  }
+  const held = await read($, lastReplyAt)
+  return held !== null && (at === undefined || held > at) ? held : at
+}
+
+/** 대화별 칸이 KEEP보다 꽤 많이 쌓이면 오래된 것부터 지운다. 시작할 때만 본다. */
+async function pruneReplies($: EngineInterface) {
+  const keys = (await $.store.keys()).filter(k => k.startsWith(REPLY_KEY))
+  if (keys.length <= KEEP + 20) return
+  const dated = await Promise.all(keys.map(async k => [k, Number(await $.store.get(k)) || 0] as const))
+  for (const [k] of dated.sort((a, b) => b[1] - a[1]).slice(KEEP)) await $.store.delete(k)
+}
+
+/**
+ * 시작 준비: 설정을 읽고, 이 대화의 마지막 응답 시각과 크기를 되살리고, 원격 제어를 보고, 박동과 마감 확인을 켠다. 던지지 않는다.
+ * 보통 session.start에서 하지만, mod를 다시 읽은 엔진이 session.start 없이 턴을 내면 그 턴에서 한다(via).
+ */
+async function init($: EngineInterface, options: Readonly<Record<string, unknown>>, via: string) {
+  let opts: Readonly<Record<string, unknown>> = options
+  try {
+    const saved = savedOptions((await $.settings.read({ source: 'user' })).pluginConfigs, $.plugin.name)
+    if (saved) opts = { ...options, ...saved }
+  } catch {
+    // 설정을 못 읽으면 엔진이 준 값대로 돈다
+  }
+  autoCompact = opts?.autoCompact === 'on'
+  keepAliveMs = keepAliveOf(opts?.keepAlive)
+  let root = ''
+  try {
+    root = String($.plugin.root ?? '')
+    version = root.split(/[\\/]/).filter(Boolean).pop() ?? ''   // 설치본은 폴더 이름이 버전이다
+  } catch {
+    version = ''
+  }
+  // 앱이 mod를 어디서 읽는지(설치본인지 작업 폴더인지)와 어떤 이름으로 부르는지도 남긴다
+  let name = ''
+  try {
+    name = String($.plugin.name ?? '')
+  } catch {
+    name = ''
+  }
+  await logEvent($, 'start', { autoCompact, keepAlive: String(opts?.keepAlive ?? 'off'), from_install: opts !== options, name, root,
+                               ...(via === 'session.start' ? {} : { via }) })
+  try {
+    lang = pickLang(opts?.lang, await $.env.get('TOKENRX_LANG'))
+    const last = await savedReplyAt($, await $.session.id())
+    if (last !== undefined) {
+      await update($, lastReplyAt, () => last)
+      idleSince ??= last
+    }
+    await measure($, await $.session.usage())
+    const t = await $.clock.now()
+    await update($, now, () => t)
+  } catch {
+    // 처음 여는 대화는 아직 잰 값이 없다
+  }
+  try {
+    await pruneReplies($)
+  } catch (err) {
+    await logError($, 'prune', err)
+  }
+  await checkRemoteControl($, true)
+  await startTicking($)
+  // 박동과 따로, 마지막 응답의 캐시가 식기 직전에도 한 번 확인한다(다시 시작한 직후 박동이 늦게 붙어도 놓치지 않게)
+  try {
+    const last = await read($, lastReplyAt)
+    if (last !== null) await armDue($, last)
+  } catch (err) {
+    await logError($, 'arm', err)
+  }
+}
+
+/** 시작 준비를 한다. 실패해도 그 실패를 기다리던 턴 훅이 함께 멈추지 않게, 남기고 삼킨다 */
+function begin($: EngineInterface, options: Readonly<Record<string, unknown>>, via: string) {
+  return init($, options, via).catch(err => logError($, 'init', err))
 }
 
 export const register: Register = (on, options) => {
@@ -726,86 +904,56 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
-    let opts: Readonly<Record<string, unknown>> = options
-    try {
-      const saved = savedOptions((await $.settings.read({ source: 'user' })).pluginConfigs, $.plugin.name)
-      if (saved) opts = { ...options, ...saved }
-    } catch {
-      // 설정을 못 읽으면 엔진이 준 값대로 돈다
-    }
-    autoCompact = opts?.autoCompact === 'on'
-    keepAliveMs = keepAliveOf(opts?.keepAlive)
-    let root = ''
-    try {
-      root = String($.plugin.root ?? '')
-      version = root.split(/[\\/]/).filter(Boolean).pop() ?? ''   // 설치본은 폴더 이름이 버전이다
-    } catch {
-      version = ''
-    }
-    // 앱이 mod를 어디서 읽는지(설치본인지 작업 폴더인지)와 어떤 이름으로 부르는지도 남긴다
-    let name = ''
-    try {
-      name = String($.plugin.name ?? '')
-    } catch {
-      name = ''
-    }
-    await logEvent($, 'start', { autoCompact, keepAlive: String(opts?.keepAlive ?? 'off'), from_install: opts !== options, name, root })
-    try {
-      lang = pickLang(opts?.lang, await $.env.get('TOKENRX_LANG'))
-      const id = await $.session.id()
-      const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>
-      const last = seen[id]
-      if (typeof last === 'number') {
-        await update($, lastReplyAt, () => last)
-        idleSince ??= last
-      }
-      await measure($, await $.session.usage())
-      const t = await $.clock.now()
-      await update($, now, () => t)
-    } catch {
-      // 처음 여는 대화는 아직 잰 값이 없다
-    }
-    await checkRemoteControl($, true)
-    startTicking($)
+    await (ready = begin($, options, 'session.start'))
     return result
   })
 
   // 서브에이전트의 실행은 turn.start를 내지 않는다(엔진 문서). 그래서 여기 오는 것은 본 대화의 턴이다
-  on('turn.start', ($, e, next) => {
+  on('turn.start', async ($, e, next) => {
     isWorking = true
     openTurn = e.turnId
     if (pinging) {
       pingTurn = e.turnId
       pinging = false
     }
-    return next(e)
+    const result = await next(e)
+    await (ready ??= begin($, options, 'turn.start'))   // 다시 읽힌 mod가 session.start를 받지 못했으면 여기서 시작한다
+    return result
   })
 
+  // 하나가 실패해도 나머지(박동 되살리기, 마감 확인, 마지막 응답 시각 저장)는 한다
   on('turn.complete', async ($, e, next) => {
     if (e.agentId) return next(e)   // 서브에이전트의 턴은 이 대화의 캐시를 새로 하지 않는다
     isWorking = false
     openTurn = null
     const wasPing = e.turnId === pingTurn
     pingTurn = null
+    await (ready ??= begin($, options, 'turn.complete'))
+    let t: number
     try {
-      const t = await $.clock.now()
+      t = await $.clock.now()
       if (!wasPing) idleSince = t   // 살려 두기 턴은 캐시만 새로 하고, 사람이 쓴 시각은 그대로 둔다
       await update($, lastReplyAt, () => t)
       await update($, now, () => t)
-      if (lastTickAt && t - lastTickAt > 3 * TICK) {   // 타이머가 멈춰 있었다: 남기고 다시 켠다
-        await logEvent($, 'timer_stalled', { stalled_s: Math.round((t - lastTickAt) / 1000) })
-        lastTickAt = t
-        startTicking($)
-      }
+    } catch (err) {
+      await logError($, 'turn_clock', err)
+      return next(e)
+    }
+    try {
+      await reviveTicking($, t)
+    } catch (err) {
+      await logError($, 'revive', err)
+    }
+    try {
       await armDue($, t)
-      await checkRemoteControl($, true)
-      const id = await $.session.id()
-      const seen = ((await $.store.get('lastReplyAt')) ?? {}) as Record<string, number>
-      seen[id] = t
-      const kept = Object.entries(seen).sort((a, b) => b[1] - a[1]).slice(0, KEEP)
-      await $.store.set('lastReplyAt', Object.fromEntries(kept))
-    } catch {
-      // 기억해 두지 못해도 이번 표시는 맞다
+    } catch (err) {
+      await logError($, 'arm', err)
+    }
+    await checkRemoteControl($, true)
+    try {
+      await $.store.set(REPLY_KEY + (await $.session.id()), t)
+    } catch (err) {
+      await logError($, 'save_reply', err)
     }
     return next(e)
   })
