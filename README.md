@@ -2,12 +2,12 @@
 
 English | [한국어](README.ko.md)
 
-TokenRx reads your local Claude Code and Codex logs and tells you **where your tokens and usage limits went**. It can then fix the settings that cause the waste.
+TokenRx reads your local Claude Code and Codex logs and tells you **where your tokens and usage limits went**. It can then fix the settings that cause the waste. A [Claude Code mod](#the-tokenrx-mod) also shows your limits and the prompt cache as you work, and keeps long chats warm while you're away.
 
 ![Sample report (synthetic data)](docs/sample-report-en.png)
 
 - **Local only.** Nothing leaves your machine, and there is no telemetry.
-- **No conversation content in the report.** The report reads token counts and metadata only (model, timestamps, whether a tool was used). The one exception is the optional idle guard: when it pauses an expensive resume, it writes a short handoff note (your recent requests, the last reply, files edited) to a local file so a new conversation can pick up cheaply. That note never leaves your PC.
+- **No conversation content in the report.** The report reads token counts and metadata only (model, timestamps, whether a tool was used). The exceptions are the optional idle guard and the mod's new-chat button: when they hand a long conversation over, they write a short handoff note (your recent requests, the last reply, files edited) to a local file so a new conversation can pick up cheaply. That note never leaves your PC.
 - **No dependencies.** Python 3.10+ standard library.
 
 ## Quick start
@@ -54,7 +54,7 @@ python tokenrx.py backups         # list backups
 | Name | What it does |
 |---|---|
 | `claude-idle-guard` | `UserPromptSubmit` and `SessionStart` hooks. When you resume a long conversation after its cache expired, it pauses once and shows the estimated cost. It also writes a short handoff note. Open a new conversation in the same folder and say "continue": the new conversation is told where the note is, and picks up the work for a few thousand tokens instead of rebuilding the whole context. To go ahead anyway, send the same message again within 10 minutes. |
-| `claude-limit-recorder` | A status line that shows 5-hour and weekly limit usage plus time left on the prompt cache, and nudges you to `/compact` before a long conversation's cache runs out. It records limit snapshots so the report can forecast when you'll hit the limit. Works only in `claude` run from a terminal (the Claude desktop app doesn't run status lines). |
+| `claude-limit-recorder` | A status line that shows 5-hour and weekly limit usage plus time left on the prompt cache, and nudges you to `/compact` before a long conversation's cache runs out. It records limit snapshots so the report can forecast when you'll hit the limit. Works only in `claude` run from a terminal (the Claude desktop app doesn't run status lines; there, the [mod](#the-tokenrx-mod) records limits instead). |
 | `claude-autocompact` | Sets `autoCompactWindow` to 400K tokens, so long conversations compact well before the 967K default. Older details get summarized when it compacts. |
 | `claude-subagent-sonnet` | Sets `CLAUDE_CODE_SUBAGENT_MODEL=sonnet`. |
 | `claude-default-opus` | Sets the default model to Opus. |
@@ -63,6 +63,42 @@ python tokenrx.py backups         # list backups
 
 - **Files touched:** `~/.claude/settings.json`, `~/.claude/tokenrx/`, `~/.codex/config.toml` and `~/.codex/AGENTS.md`.
 - **Undo:** originals are saved in `backups/`, and `undo` restores them byte for byte.
+
+## The TokenRx mod
+
+The report looks back at your logs. The mod works live inside Claude Code, in the terminal and in the Claude desktop app.
+
+```
+claude plugin marketplace add latentcairn/tokenrx
+claude plugin install tokenrx@latentcairn
+```
+
+It applies to chats started after you install it. If the band doesn't appear, restart the desktop app.
+
+- **A band above the prompt:** 5-hour and weekly limit use, this chat's size and the minutes left on its prompt cache. The model doesn't read the band, so it costs no tokens.
+- **Before a long chat's cache cools:** for a chat of 100K+ tokens, it warns once, five minutes before the cache expires. With `keepAlive`, it sends a one-line nudge instead, which refreshes the cache for about 1/40 of rewriting it, for up to the chosen hours after your last message. With `autoCompact on`, it compacts the chat when keep-alive is off or its hours are up.
+- **After a long chat has cooled:** the band shows what sending one more message would cost. In the desktop app, a **Continue in a new chat** button writes a handoff note and opens a new chat in the same folder, which starts by reading the note.
+- **Desktop app and Remote Control:** recent versions of the desktop app pause a chat a minute or two after you switch away from it, unless it is working, has background tasks or has Remote Control on. The mod pauses with the chat, so it can't keep the cache warm. Turn on Remote Control for long chats, or turn on **Connect new sessions to Remote Control** in the app's settings. With `keepAlive` or `autoCompact` on, the band reminds you when a long chat has it off.
+- **Limit log:** each change in your limits is appended to `~/.claude/tokenrx/limits.jsonl`, which the report's limit forecast reads.
+- **Tidy chats:** `/tokenrx:tidy`, [below](#tidy-desktop-chats).
+
+Options go in `~/.claude/settings.json`:
+
+```json
+"pluginConfigs": {
+  "tokenrx@latentcairn": { "options": { "lang": "auto", "autoCompact": "on", "keepAlive": "12h" } }
+}
+```
+
+| Option | Values | Default |
+|---|---|---|
+| `lang` | `auto` (follows `TOKENRX_LANG`, then the system language), `ko`, `en` | `auto` |
+| `autoCompact` | `off`, `on` | `off` |
+| `keepAlive` | `off`, `4h`, `8h`, `12h`, `24h` | `off` |
+
+- `keepAlive` needs a Claude subscription (it relies on the one-hour cache), and the PC and the app must stay on.
+- Every decision (nudge, compaction, skip, Remote Control state) is logged to `~/.claude/tokenrx/mod-events.jsonl`.
+- In the desktop app, the mod reads the app's own record of the current chat only to see whether Remote Control is on.
 
 ## Tidy desktop chats
 
@@ -114,6 +150,7 @@ python eval/run.py --claude <path to claude> --exp autocompact --model claude-ha
 - **The Claude Code log format can change.** It is internal and undocumented, so it may change between versions. Unknown lines are skipped.
 - **Large Codex logs are slow once.** The first run over several GB of logs can take about a minute. Results are cached in `cache/`, so later runs take seconds.
 - **The limit recorder has requirements.** It needs a Claude Pro or Max subscription and only records where the status line is shown.
+- **The mod API is early access.** It may change between Claude Code versions, and so may how the desktop app pauses idle chats.
 
 ## License
 
